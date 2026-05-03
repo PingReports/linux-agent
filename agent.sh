@@ -99,8 +99,6 @@ collect_disk() {
   for path in $PR_DISK_PATHS; do
     [ -d "$path" ] || continue
     df -PB1 "$path" 2>/dev/null | awk -v p="$path" 'NR==2 {
-      # df -PB1 is bytes, single line; mountpoint sometimes wraps so use $NF.
-      gsub(/[\.\-\/]/, "_", p); sub(/^_+/, "", p);
       printf "disk_size_bytes{path=\"%s\"}=%d\ndisk_used_bytes{path=\"%s\"}=%d\ndisk_avail_bytes{path=\"%s\"}=%d\n",
         p, $2, p, $3, p, $4
     }'
@@ -202,11 +200,13 @@ build_payload() {
     [ -n "$raw" ] || continue
     while IFS= read -r line; do
       [ -n "$line" ] || continue
-      key="${line%%=*}"; val="${line#*=}"
+      # Lines look like either `name=value` or `name{k="v"[,k2="v2"]}=value`.
+      # Use non-greedy parameter expansion to split on the LAST `=` so the
+      # `=` inside label values doesn't break the parse.
+      key="${line%=*}"; val="${line##*=}"
       base="${key%%\{*}"
       labels=""
       if [ "$base" != "$key" ]; then
-        # key has labels: name{k="v",k2="v2"}
         rest="${key#*\{}"; rest="${rest%\}}"
         labels=",\"labels\":{"
         first=1
@@ -284,8 +284,6 @@ post_one() {
   body_file="$1"
   gz_file="$2"
   gzip -c -- "$body_file" > "$gz_file"
-  status_file="$(mktemp)"
-  trap 'rm -f "$status_file"' RETURN
   http=$(
     curl -sS -o /dev/null -w '%{http_code}' \
       --max-time "$PR_HTTP_TIMEOUT" \
@@ -297,7 +295,6 @@ post_one() {
       --data-binary "@$gz_file" \
       "$PR_INGEST_URL"
   ) || http=000
-  rm -f "$status_file"
   case "$http" in
     2*) return 0 ;;
     400|401|403|413|422) log "ingest rejected http=$http (drop): $body_file"; return 0 ;;
