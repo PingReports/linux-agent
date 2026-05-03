@@ -394,29 +394,32 @@ inventory_top_processes() {
 
 inventory_listening_ports() {
   have ss || { printf '"listening_ports":[]'; return 0; }
-  printf '"listening_ports":['
-  first=1
+  # Write all entries (TCP + UDP) to a tmp file one-per-line, then comma-join.
+  # This avoids the POSIX subshell-variable-scoping trap where two separate
+  # `while-read` pipes can't share a "first" flag.
+  tmp="$(mktemp)"
   ss -tlnpH 2>/dev/null | head -100 | while IFS= read -r line; do
     addr=$(printf '%s' "$line" | awk '{print $4}')
     proc=$(printf '%s' "$line" | awk '{print $NF}')
     [ -z "$addr" ] && continue
     port="${addr##*:}"
-    [ "$first" = "1" ] && first=0 || printf ','
-    printf '{"proto":"tcp","addr":"%s","port":%s,"proc":"%s"}' \
+    printf '{"proto":"tcp","addr":"%s","port":%s,"proc":"%s"}\n' \
       "$(printf '%s' "${addr%:*}" | json_escape)" "$port" \
-      "$(printf '%s' "$proc" | json_escape)"
+      "$(printf '%s' "$proc" | json_escape)" >> "$tmp"
   done
   ss -ulnpH 2>/dev/null | head -50 | while IFS= read -r line; do
     addr=$(printf '%s' "$line" | awk '{print $4}')
     proc=$(printf '%s' "$line" | awk '{print $NF}')
     [ -z "$addr" ] && continue
     port="${addr##*:}"
-    [ "$first" = "1" ] && first=0 || printf ','
-    printf '{"proto":"udp","addr":"%s","port":%s,"proc":"%s"}' \
+    printf '{"proto":"udp","addr":"%s","port":%s,"proc":"%s"}\n' \
       "$(printf '%s' "${addr%:*}" | json_escape)" "$port" \
-      "$(printf '%s' "$proc" | json_escape)"
+      "$(printf '%s' "$proc" | json_escape)" >> "$tmp"
   done
+  printf '"listening_ports":['
+  awk 'NR>1{printf ","} {printf "%s", $0}' "$tmp"
   printf ']'
+  rm -f "$tmp"
 }
 
 inventory_docker() {
