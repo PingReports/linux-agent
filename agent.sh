@@ -441,7 +441,7 @@ inventory_docker() {
           "$(printf '%s' "$state" | json_escape)" \
           "$(printf '%s' "$running" | json_escape)" \
           "$(printf '%s' "$ports" | json_escape)" \
-          "$(printf '%s' "${cid:0:12}" | json_escape)"
+          "$(printf '%s' "$cid" | cut -c1-12 | json_escape)"
       done
   printf ']}'
 }
@@ -464,7 +464,7 @@ inventory_podman() {
           "$(printf '%s' "$image" | json_escape)" \
           "$(printf '%s' "$status" | json_escape)" \
           "$(printf '%s' "$state" | json_escape)" \
-          "$(printf '%s' "${cid:0:12}" | json_escape)"
+          "$(printf '%s' "$cid" | cut -c1-12 | json_escape)"
       done
   printf ']}'
 }
