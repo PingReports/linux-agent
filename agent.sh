@@ -343,53 +343,46 @@ inventory_capabilities() {
 }
 
 inventory_top_processes() {
-  # Two slices: top-N by CPU and top-N by RSS. Dedup by pid client-side
-  # to avoid shipping the same row twice when a process is hot on both.
+  # Tab-separated process snapshot (POSIX-portable; the bash-only `$'\037'`
+  # form fails silently in dash). Columns: pid \t user \t pcpu \t pmem \t
+  # rss \t comm \t args.
+  src="$(mktemp)"
   ps -eo pid,user:20,pcpu,pmem,rss,comm,args --no-headers 2>/dev/null \
-    | awk -v top="$PR_TOP_N" '{
-        # Trim leading spaces.
+    | awk '{
         sub(/^[ \t]+/, "")
         pid=$1; user=$2; pcpu=$3; pmem=$4; rss=$5; comm=$6
-        # Reconstruct args by stripping the first six fields.
         $1=$2=$3=$4=$5=$6=""
         sub(/^[ \t]+/, "")
         args=$0
-        printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\n", pid, user, pcpu, pmem, rss, comm, args
-      }' > /tmp/.pr-procs.$$
-  printf '"top_proc_cpu":['
-  first=1
-  sort -t $'\037' -k3,3 -gr /tmp/.pr-procs.$$ 2>/dev/null | head -"$PR_TOP_N" | while IFS= read -r line; do
-    pid=$(printf '%s' "$line" | awk -F '\037' '{print $1}')
-    user=$(printf '%s' "$line" | awk -F '\037' '{print $2}')
-    pcpu=$(printf '%s' "$line" | awk -F '\037' '{print $3}')
-    pmem=$(printf '%s' "$line" | awk -F '\037' '{print $4}')
-    rss=$(printf '%s' "$line" | awk -F '\037' '{print $5}')
-    comm=$(printf '%s' "$line" | awk -F '\037' '{print $6}')
-    args=$(printf '%s' "$line" | awk -F '\037' '{print $7}' | cut -c1-200)
-    [ "$first" = "1" ] && first=0 || printf ','
-    printf '{"pid":%s,"user":"%s","cpu":%s,"mem":%s,"rss_kb":%s,"comm":"%s","args":"%s"}' \
-      "$pid" "$(printf '%s' "$user" | json_escape)" "$pcpu" "$pmem" "$rss" \
-      "$(printf '%s' "$comm" | json_escape)" \
-      "$(printf '%s' "$args" | json_escape)"
-  done
-  printf '],"top_proc_mem":['
-  first=1
-  sort -t $'\037' -k5,5 -gr /tmp/.pr-procs.$$ 2>/dev/null | head -"$PR_TOP_N" | while IFS= read -r line; do
-    pid=$(printf '%s' "$line" | awk -F '\037' '{print $1}')
-    user=$(printf '%s' "$line" | awk -F '\037' '{print $2}')
-    pcpu=$(printf '%s' "$line" | awk -F '\037' '{print $3}')
-    pmem=$(printf '%s' "$line" | awk -F '\037' '{print $4}')
-    rss=$(printf '%s' "$line" | awk -F '\037' '{print $5}')
-    comm=$(printf '%s' "$line" | awk -F '\037' '{print $6}')
-    args=$(printf '%s' "$line" | awk -F '\037' '{print $7}' | cut -c1-200)
-    [ "$first" = "1" ] && first=0 || printf ','
-    printf '{"pid":%s,"user":"%s","cpu":%s,"mem":%s,"rss_kb":%s,"comm":"%s","args":"%s"}' \
-      "$pid" "$(printf '%s' "$user" | json_escape)" "$pcpu" "$pmem" "$rss" \
-      "$(printf '%s' "$comm" | json_escape)" \
-      "$(printf '%s' "$args" | json_escape)"
-  done
-  printf ']'
-  rm -f /tmp/.pr-procs.$$
+        gsub(/\t/, " ", args)
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", pid, user, pcpu, pmem, rss, comm, args
+      }' > "$src"
+
+  emit_proc_array() {
+    sort_key="$1"  # 3 = pcpu, 5 = rss
+    out_label="$2"
+    printf '"%s":[' "$out_label"
+    join_tmp="$(mktemp)"
+    sort -t '	' -k"$sort_key,$sort_key" -gr "$src" 2>/dev/null | head -"$PR_TOP_N" \
+      | while IFS='	' read -r pid user pcpu pmem rss comm args; do
+          [ -z "$pid" ] && continue
+          args_short=$(printf '%s' "$args" | cut -c1-200)
+          printf '{"pid":%s,"user":"%s","cpu":%s,"mem":%s,"rss_kb":%s,"comm":"%s","args":"%s"}\n' \
+            "$pid" \
+            "$(printf '%s' "$user" | json_escape)" \
+            "$pcpu" "$pmem" "$rss" \
+            "$(printf '%s' "$comm" | json_escape)" \
+            "$(printf '%s' "$args_short" | json_escape)" >> "$join_tmp"
+        done
+    awk 'NR>1{printf ","} {printf "%s", $0}' "$join_tmp"
+    printf ']'
+    rm -f "$join_tmp"
+  }
+
+  emit_proc_array 3 "top_proc_cpu"
+  printf ','
+  emit_proc_array 5 "top_proc_mem"
+  rm -f "$src"
 }
 
 inventory_listening_ports() {
