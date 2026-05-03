@@ -4,8 +4,7 @@
 # Runs as the unprivileged pingreports-agent user under systemd. Wakes on
 # the timer, samples host metrics + inventory, gzips a JSON payload,
 # POSTs to the configured ingest endpoint with a Bearer token, then
-# exits. Designed to be runnable on any POSIX shell that ships with
-# Debian/Ubuntu/RHEL/Alma/Rocky/SUSE/Arch.
+# exits. POSIX sh — Debian/Ubuntu/RHEL/Alma/Rocky/SUSE/Arch all in scope.
 
 set -eu
 
@@ -25,11 +24,13 @@ die() { log "ERROR: $1"; exit 1; }
 : "${PR_AGENT_TOKEN:?PR_AGENT_TOKEN missing}"
 : "${PR_INGEST_URL:?PR_INGEST_URL missing}"
 PR_AGENT_NAME="${PR_AGENT_NAME:-$(hostname)}"
-PR_AGENT_VERSION="${PR_AGENT_VERSION:-0.1.0}"
+PR_AGENT_VERSION="${PR_AGENT_VERSION:-0.2.0}"
 PR_NET_IFACES="${PR_NET_IFACES:-}"
 PR_DISK_PATHS="${PR_DISK_PATHS:-/}"
 PR_HTTP_TIMEOUT="${PR_HTTP_TIMEOUT:-30}"
 PR_QUEUE_MAX="${PR_QUEUE_MAX:-50}"
+PR_TOP_N="${PR_TOP_N:-20}"
+PR_SERVICES_MAX="${PR_SERVICES_MAX:-300}"
 
 mkdir -p "$QUEUE_DIR"
 
@@ -39,9 +40,9 @@ trap 'rm -f "$PAYLOAD" "$GZ"' EXIT INT TERM
 
 now_iso() { date -u +'%Y-%m-%dT%H:%M:%SZ'; }
 now_epoch() { date +%s; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
 # json_escape — escape a single value for embedding in a JSON string literal.
-# Avoids pulling in jq as a hard dependency on minimal images.
 json_escape() {
   awk 'BEGIN{
     for (i=0;i<32;i++) tab[sprintf("%c",i)]=sprintf("\\u%04x",i);
@@ -51,20 +52,24 @@ json_escape() {
   { for (i=1;i<=length($0);i++){c=substr($0,i,1); printf "%s", (c in tab)?tab[c]:c} printf "" }'
 }
 
-emit_kv_string() { printf '"%s":"%s"' "$1" "$(printf '%s' "$2" | json_escape)"; }
-emit_kv_number() { printf '"%s":%s' "$1" "$2"; }
-
 # ---------------------------------------------------------------------------
-# Metric collectors. Each prints "name=value" lines on stdout. Failure of
-# any single collector is non-fatal — we capture what we can and move on.
+# Time-series metric collectors. Each prints "name=value" or
+# "name{k=\"v\"}=value" lines to stdout. Failures are non-fatal.
 # ---------------------------------------------------------------------------
 
 collect_cpu() {
   if [ -r /proc/stat ]; then
     awk '/^cpu /{
       idle=$5+$6; total=$2+$3+$4+$5+$6+$7+$8+$9;
-      printf "cpu_user=%d\ncpu_system=%d\ncpu_idle=%d\ncpu_iowait=%d\ncpu_total=%d\n",
-        $2, $4, $5, $6, total }' /proc/stat
+      printf "cpu_user=%d\ncpu_system=%d\ncpu_idle=%d\ncpu_iowait=%d\ncpu_irq=%d\ncpu_softirq=%d\ncpu_steal=%d\ncpu_total=%d\n",
+        $2, $4, $5, $6, $7, $8, $9, total }' /proc/stat
+  fi
+  if [ -r /proc/stat ]; then
+    awk '/^ctxt/{ printf "cpu_ctxt=%d\n", $2 }
+         /^processes/{ printf "cpu_forks=%d\n", $2 }
+         /^procs_running/{ printf "cpu_procs_running=%d\n", $2 }
+         /^procs_blocked/{ printf "cpu_procs_blocked=%d\n", $2 }
+         /^intr/{ printf "cpu_intr=%d\n", $2 }' /proc/stat
   fi
 }
 
@@ -87,9 +92,12 @@ collect_mem() {
       /^Cached:/        { cache=$2 }
       /^SwapTotal:/     { stot=$2 }
       /^SwapFree:/      { sfree=$2 }
+      /^Dirty:/         { dirty=$2 }
+      /^Slab:/          { slab=$2 }
+      /^Shmem:/         { shmem=$2 }
       END {
-        printf "mem_total_kb=%d\nmem_available_kb=%d\nmem_free_kb=%d\nmem_buffers_kb=%d\nmem_cached_kb=%d\nswap_total_kb=%d\nswap_free_kb=%d\n",
-          tot, avail, free, buf, cache, stot, sfree
+        printf "mem_total_kb=%d\nmem_available_kb=%d\nmem_free_kb=%d\nmem_buffers_kb=%d\nmem_cached_kb=%d\nmem_dirty_kb=%d\nmem_slab_kb=%d\nmem_shmem_kb=%d\nswap_total_kb=%d\nswap_free_kb=%d\n",
+          tot, avail, free, buf, cache, dirty, slab, shmem, stot, sfree
       }' /proc/meminfo
   fi
 }
@@ -102,8 +110,31 @@ collect_disk() {
       printf "disk_size_bytes{path=\"%s\"}=%d\ndisk_used_bytes{path=\"%s\"}=%d\ndisk_avail_bytes{path=\"%s\"}=%d\n",
         p, $2, p, $3, p, $4
     }'
+    df -Pi "$path" 2>/dev/null | awk -v p="$path" 'NR==2 {
+      printf "disk_inodes_total{path=\"%s\"}=%d\ndisk_inodes_used{path=\"%s\"}=%d\n",
+        p, $2, p, $3
+    }'
   done
   IFS="$oldifs"
+}
+
+collect_diskio() {
+  [ -r /proc/diskstats ] || return 0
+  # /proc/diskstats: f0=major f1=minor f2=name f3=reads_done f4=reads_merged
+  # f5=sectors_read f6=ms_reading f7=writes_done f8=writes_merged
+  # f9=sectors_written f10=ms_writing f11=ios_in_progress f12=ms_io
+  awk '{
+    name=$3
+    # Skip partitions of the same disk to keep cardinality bounded; we keep
+    # whole-device entries (sd[a-z], nvmeNnN, vdN, dm-N) and root logical
+    # volumes. Not perfect but cheap.
+    if (name ~ /^loop/ || name ~ /^ram/ || name ~ /^sr[0-9]/) next
+    if (name ~ /^sd[a-z]+[0-9]+$/) next
+    if (name ~ /^nvme[0-9]+n[0-9]+p[0-9]+$/) next
+    if (name ~ /^vd[a-z]+[0-9]+$/) next
+    printf "diskio_reads{dev=\"%s\"}=%d\ndiskio_read_bytes{dev=\"%s\"}=%d\ndiskio_writes{dev=\"%s\"}=%d\ndiskio_write_bytes{dev=\"%s\"}=%d\ndiskio_busy_ms{dev=\"%s\"}=%d\ndiskio_inflight{dev=\"%s\"}=%d\n",
+      name, $4, name, $6*512, name, $8, name, $10*512, name, $13, name, $12
+  }' /proc/diskstats
 }
 
 collect_net() {
@@ -118,22 +149,400 @@ collect_net() {
         for (i=1;i<=n;i++) if (w[i]==iface) keep=1;
         if (!keep) next;
       }
-      printf "net_rx_bytes{iface=\"%s\"}=%d\nnet_rx_packets{iface=\"%s\"}=%d\nnet_rx_errs{iface=\"%s\"}=%d\nnet_tx_bytes{iface=\"%s\"}=%d\nnet_tx_packets{iface=\"%s\"}=%d\nnet_tx_errs{iface=\"%s\"}=%d\n",
-        iface, $2, iface, $3, iface, $4, iface, $10, iface, $11, iface, $12
+      printf "net_rx_bytes{iface=\"%s\"}=%d\nnet_rx_packets{iface=\"%s\"}=%d\nnet_rx_errs{iface=\"%s\"}=%d\nnet_rx_drops{iface=\"%s\"}=%d\nnet_tx_bytes{iface=\"%s\"}=%d\nnet_tx_packets{iface=\"%s\"}=%d\nnet_tx_errs{iface=\"%s\"}=%d\nnet_tx_drops{iface=\"%s\"}=%d\n",
+        iface, $2, iface, $3, iface, $4, iface, $5, iface, $10, iface, $11, iface, $12, iface, $13
     }' /proc/net/dev
+  # Per-iface link speed (Mbps) when known.
+  for d in /sys/class/net/*; do
+    [ -e "$d" ] || continue
+    name="$(basename "$d")"
+    [ "$name" = "lo" ] && continue
+    if [ -r "$d/speed" ]; then
+      speed=$(cat "$d/speed" 2>/dev/null) || speed=""
+      [ -n "$speed" ] && [ "$speed" -gt 0 ] 2>/dev/null && \
+        printf 'net_link_mbps{iface="%s"}=%s\n' "$name" "$speed"
+    fi
+  done
+}
+
+collect_sockets() {
+  [ -r /proc/net/sockstat ] || return 0
+  awk '
+    /^TCP:/ { for (i=2;i<=NF-1;i++) if ($i=="inuse") tcp_inuse=$(i+1); else if ($i=="tw") tcp_tw=$(i+1); else if ($i=="orphan") tcp_orphan=$(i+1) }
+    /^UDP:/ { for (i=2;i<=NF-1;i++) if ($i=="inuse") udp_inuse=$(i+1) }
+    /^sockets:/ { for (i=2;i<=NF-1;i++) if ($i=="used") used=$(i+1) }
+    END {
+      printf "sock_total=%d\nsock_tcp_inuse=%d\nsock_tcp_tw=%d\nsock_tcp_orphan=%d\nsock_udp_inuse=%d\n",
+        used+0, tcp_inuse+0, tcp_tw+0, tcp_orphan+0, udp_inuse+0
+    }' /proc/net/sockstat
+  if have ss; then
+    # ss is in iproute2; widely available.
+    states=$(ss -antH 2>/dev/null | awk '{print $1}' | sort | uniq -c)
+    [ -z "$states" ] && return 0
+    printf '%s\n' "$states" | while read -r count state; do
+      [ -z "$state" ] && continue
+      printf 'sock_state{kind="tcp",state="%s"}=%d\n' "$state" "$count"
+    done
+    udp_listen=$(ss -anuH 2>/dev/null | wc -l | awk '{print $1}')
+    [ -n "$udp_listen" ] && printf 'sock_state{kind="udp",state="LISTEN"}=%d\n' "$udp_listen"
+  fi
+}
+
+collect_files() {
+  if [ -r /proc/sys/fs/file-nr ]; then
+    awk '{ printf "fd_open=%d\nfd_unused=%d\nfd_max=%d\n", $1, $2, $3 }' /proc/sys/fs/file-nr
+  fi
 }
 
 collect_uptime() {
   [ -r /proc/uptime ] || return 0
-  awk '{ printf "uptime_seconds=%d\n", $1 }' /proc/uptime
+  awk '{ printf "uptime_seconds=%d\nidle_seconds=%d\n", $1, $2 }' /proc/uptime
+}
+
+collect_users() {
+  if have who; then
+    n=$(who 2>/dev/null | wc -l | awk '{print $1}')
+    printf 'users_logged_in=%s\n' "${n:-0}"
+  fi
+}
+
+collect_proc_counts() {
+  total=$(ls -1 /proc 2>/dev/null | grep -c '^[0-9]\+$' || echo 0)
+  zombie=$(awk '/^State:.*Z/{c++} END{print c+0}' /proc/[0-9]*/status 2>/dev/null || echo 0)
+  threads=$(awk '/^Threads:/{t+=$2} END{print t+0}' /proc/[0-9]*/status 2>/dev/null || echo 0)
+  printf 'proc_count=%s\nproc_zombie=%s\nproc_threads=%s\n' "${total:-0}" "${zombie:-0}" "${threads:-0}"
+}
+
+collect_temps() {
+  # lm-sensors: emit tempN per sensor if present.
+  if have sensors; then
+    sensors -A 2>/dev/null | awk '
+      /^[A-Za-z0-9_-]+$/ { adapter=$1; next }
+      /^Adapter:/ { next }
+      /:/ {
+        # Match "  Sensor Name:  +42.0°C  ..." or similar.
+        n=split($0, parts, ":")
+        if (n < 2) next
+        label=parts[1]; sub(/^[ \t]+/, "", label); sub(/[ \t]+$/, "", label)
+        gsub(/[^A-Za-z0-9_]/, "_", label)
+        rest=parts[2]
+        # Extract first numeric value (pcpu /pmem etc).
+        if (match(rest, /[+-]?[0-9]+\.[0-9]+/)) {
+          v = substr(rest, RSTART, RLENGTH)
+          if (rest ~ /°C/ || rest ~ / C/) {
+            printf "sensor_temp_c{name=\"%s\"}=%s\n", (adapter "_" label), v
+          } else if (rest ~ / V/) {
+            printf "sensor_volt{name=\"%s\"}=%s\n", (adapter "_" label), v
+          } else if (rest ~ /RPM/) {
+            printf "sensor_fan_rpm{name=\"%s\"}=%s\n", (adapter "_" label), v
+          }
+        }
+      }'
+  fi
+}
+
+collect_systemd_counts() {
+  have systemctl || return 0
+  total=$(systemctl list-units --type=service --no-pager --no-legend --plain 2>/dev/null | wc -l | awk '{print $1}')
+  active=$(systemctl list-units --type=service --state=active --no-pager --no-legend --plain 2>/dev/null | wc -l | awk '{print $1}')
+  failed=$(systemctl list-units --type=service --state=failed --no-pager --no-legend --plain 2>/dev/null | wc -l | awk '{print $1}')
+  printf 'systemd_units_total=%s\nsystemd_units_active=%s\nsystemd_units_failed=%s\n' \
+    "${total:-0}" "${active:-0}" "${failed:-0}"
+}
+
+collect_docker_metrics() {
+  have docker || return 0
+  docker info >/dev/null 2>&1 || return 0
+  running=$(docker ps -q 2>/dev/null | wc -l | awk '{print $1}')
+  total=$(docker ps -aq 2>/dev/null | wc -l | awk '{print $1}')
+  images=$(docker images -q 2>/dev/null | wc -l | awk '{print $1}')
+  printf 'docker_containers_running=%s\ndocker_containers_total=%s\ndocker_images=%s\n' \
+    "${running:-0}" "${total:-0}" "${images:-0}"
+  # Per-container resource usage. Limit to top-30 by ID order to bound cost.
+  docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.BlockIO}}|{{.PIDs}}' 2>/dev/null \
+    | head -30 \
+    | while IFS='|' read -r name cpu mem netio blockio pids; do
+        [ -z "$name" ] && continue
+        cpu_n=$(printf '%s' "$cpu" | sed 's/%//')
+        mem_b=$(printf '%s' "$mem" | awk -F/ '{print $1}' | tr -d '[:space:]' | awk '{
+          v=$0; suf="";
+          if (match(v, /[KMGTPE]i?B$/)) { suf=substr(v,RSTART,RLENGTH); v=substr(v,1,RSTART-1) }
+          mul=1
+          if (suf=="KiB" || suf=="KB") mul=1024
+          else if (suf=="MiB" || suf=="MB") mul=1048576
+          else if (suf=="GiB" || suf=="GB") mul=1073741824
+          else if (suf=="TiB" || suf=="TB") mul=1099511627776
+          printf "%d", v*mul
+        }')
+        net_rx=$(printf '%s' "$netio" | awk -F/ '{print $1}' | tr -d '[:space:]' | awk '{
+          v=$0; suf="";
+          if (match(v, /[KMGTPE]i?B$/)) { suf=substr(v,RSTART,RLENGTH); v=substr(v,1,RSTART-1) }
+          mul=1
+          if (suf=="KiB" || suf=="kB") mul=1024
+          else if (suf=="MiB" || suf=="MB") mul=1048576
+          else if (suf=="GiB" || suf=="GB") mul=1073741824
+          printf "%d", v*mul
+        }')
+        net_tx=$(printf '%s' "$netio" | awk -F/ '{print $2}' | tr -d '[:space:]' | awk '{
+          v=$0; suf="";
+          if (match(v, /[KMGTPE]i?B$/)) { suf=substr(v,RSTART,RLENGTH); v=substr(v,1,RSTART-1) }
+          mul=1
+          if (suf=="KiB" || suf=="kB") mul=1024
+          else if (suf=="MiB" || suf=="MB") mul=1048576
+          else if (suf=="GiB" || suf=="GB") mul=1073741824
+          printf "%d", v*mul
+        }')
+        printf 'docker_container_cpu_pct{name="%s"}=%s\n' "$name" "${cpu_n:-0}"
+        [ -n "$mem_b" ] && printf 'docker_container_mem_bytes{name="%s"}=%s\n' "$name" "$mem_b"
+        [ -n "$net_rx" ] && printf 'docker_container_net_rx_bytes{name="%s"}=%s\n' "$name" "$net_rx"
+        [ -n "$net_tx" ] && printf 'docker_container_net_tx_bytes{name="%s"}=%s\n' "$name" "$net_tx"
+        [ -n "$pids" ] && printf 'docker_container_pids{name="%s"}=%s\n' "$name" "$pids"
+      done
+}
+
+collect_podman_metrics() {
+  have podman || return 0
+  podman info >/dev/null 2>&1 || return 0
+  running=$(podman ps -q 2>/dev/null | wc -l | awk '{print $1}')
+  total=$(podman ps -aq 2>/dev/null | wc -l | awk '{print $1}')
+  images=$(podman images -q 2>/dev/null | wc -l | awk '{print $1}')
+  printf 'podman_containers_running=%s\npodman_containers_total=%s\npodman_images=%s\n' \
+    "${running:-0}" "${total:-0}" "${images:-0}"
+}
+
+collect_libvirt_metrics() {
+  have virsh || return 0
+  virsh list --all >/dev/null 2>&1 || return 0
+  running=$(virsh list --state-running --name 2>/dev/null | grep -c . || echo 0)
+  total=$(virsh list --all --name 2>/dev/null | grep -c . || echo 0)
+  printf 'libvirt_vms_running=%s\nlibvirt_vms_total=%s\n' "${running:-0}" "${total:-0}"
+  # Per-VM stats (running only).
+  virsh list --state-running --name 2>/dev/null | while read -r vm; do
+    [ -z "$vm" ] && continue
+    info=$(virsh dominfo "$vm" 2>/dev/null) || continue
+    cpus=$(printf '%s' "$info" | awk -F: '/CPU\(s\)/{gsub(/[ \t]/,"",$2); print $2; exit}')
+    mem=$(printf '%s' "$info" | awk -F: '/Used memory/{gsub(/[ \t]/,"",$2); sub(/KiB$/,"",$2); print $2*1024; exit}')
+    [ -n "$cpus" ] && printf 'libvirt_vm_cpus{name="%s"}=%s\n' "$vm" "$cpus"
+    [ -n "$mem" ] && printf 'libvirt_vm_mem_bytes{name="%s"}=%s\n' "$vm" "$mem"
+  done
 }
 
 # ---------------------------------------------------------------------------
-# Inventory. Distro/kernel + active services. Reported once per push so the
-# UI can surface "service down" events from the same dataset.
+# Inventory snapshots — single JSON object per push, stored on Agent.last_inventory.
 # ---------------------------------------------------------------------------
 
-collect_inventory() {
+inventory_capabilities() {
+  has_docker=false; have docker && docker info >/dev/null 2>&1 && has_docker=true
+  has_podman=false; have podman && podman info >/dev/null 2>&1 && has_podman=true
+  has_libvirt=false; have virsh && virsh list --all >/dev/null 2>&1 && has_libvirt=true
+  has_kvm=false; [ -r /dev/kvm ] && has_kvm=true
+  has_sensors=false; have sensors && sensors -A >/dev/null 2>&1 && has_sensors=true
+  has_systemd=false; have systemctl && has_systemd=true
+  printf '"capabilities":{"docker":%s,"podman":%s,"libvirt":%s,"kvm":%s,"sensors":%s,"systemd":%s}' \
+    "$has_docker" "$has_podman" "$has_libvirt" "$has_kvm" "$has_sensors" "$has_systemd"
+}
+
+inventory_top_processes() {
+  # Two slices: top-N by CPU and top-N by RSS. Dedup by pid client-side
+  # to avoid shipping the same row twice when a process is hot on both.
+  ps -eo pid,user:20,pcpu,pmem,rss,comm,args --no-headers 2>/dev/null \
+    | awk -v top="$PR_TOP_N" '{
+        # Trim leading spaces.
+        sub(/^[ \t]+/, "")
+        pid=$1; user=$2; pcpu=$3; pmem=$4; rss=$5; comm=$6
+        # Reconstruct args by stripping the first six fields.
+        $1=$2=$3=$4=$5=$6=""
+        sub(/^[ \t]+/, "")
+        args=$0
+        printf "%s\037%s\037%s\037%s\037%s\037%s\037%s\n", pid, user, pcpu, pmem, rss, comm, args
+      }' > /tmp/.pr-procs.$$
+  printf '"top_proc_cpu":['
+  first=1
+  sort -t $'\037' -k3,3 -gr /tmp/.pr-procs.$$ 2>/dev/null | head -"$PR_TOP_N" | while IFS= read -r line; do
+    pid=$(printf '%s' "$line" | awk -F '\037' '{print $1}')
+    user=$(printf '%s' "$line" | awk -F '\037' '{print $2}')
+    pcpu=$(printf '%s' "$line" | awk -F '\037' '{print $3}')
+    pmem=$(printf '%s' "$line" | awk -F '\037' '{print $4}')
+    rss=$(printf '%s' "$line" | awk -F '\037' '{print $5}')
+    comm=$(printf '%s' "$line" | awk -F '\037' '{print $6}')
+    args=$(printf '%s' "$line" | awk -F '\037' '{print $7}' | cut -c1-200)
+    [ "$first" = "1" ] && first=0 || printf ','
+    printf '{"pid":%s,"user":"%s","cpu":%s,"mem":%s,"rss_kb":%s,"comm":"%s","args":"%s"}' \
+      "$pid" "$(printf '%s' "$user" | json_escape)" "$pcpu" "$pmem" "$rss" \
+      "$(printf '%s' "$comm" | json_escape)" \
+      "$(printf '%s' "$args" | json_escape)"
+  done
+  printf '],"top_proc_mem":['
+  first=1
+  sort -t $'\037' -k5,5 -gr /tmp/.pr-procs.$$ 2>/dev/null | head -"$PR_TOP_N" | while IFS= read -r line; do
+    pid=$(printf '%s' "$line" | awk -F '\037' '{print $1}')
+    user=$(printf '%s' "$line" | awk -F '\037' '{print $2}')
+    pcpu=$(printf '%s' "$line" | awk -F '\037' '{print $3}')
+    pmem=$(printf '%s' "$line" | awk -F '\037' '{print $4}')
+    rss=$(printf '%s' "$line" | awk -F '\037' '{print $5}')
+    comm=$(printf '%s' "$line" | awk -F '\037' '{print $6}')
+    args=$(printf '%s' "$line" | awk -F '\037' '{print $7}' | cut -c1-200)
+    [ "$first" = "1" ] && first=0 || printf ','
+    printf '{"pid":%s,"user":"%s","cpu":%s,"mem":%s,"rss_kb":%s,"comm":"%s","args":"%s"}' \
+      "$pid" "$(printf '%s' "$user" | json_escape)" "$pcpu" "$pmem" "$rss" \
+      "$(printf '%s' "$comm" | json_escape)" \
+      "$(printf '%s' "$args" | json_escape)"
+  done
+  printf ']'
+  rm -f /tmp/.pr-procs.$$
+}
+
+inventory_listening_ports() {
+  have ss || { printf '"listening_ports":[]'; return 0; }
+  printf '"listening_ports":['
+  first=1
+  ss -tlnpH 2>/dev/null | head -100 | while IFS= read -r line; do
+    addr=$(printf '%s' "$line" | awk '{print $4}')
+    proc=$(printf '%s' "$line" | awk '{print $NF}')
+    [ -z "$addr" ] && continue
+    port="${addr##*:}"
+    [ "$first" = "1" ] && first=0 || printf ','
+    printf '{"proto":"tcp","addr":"%s","port":%s,"proc":"%s"}' \
+      "$(printf '%s' "${addr%:*}" | json_escape)" "$port" \
+      "$(printf '%s' "$proc" | json_escape)"
+  done
+  ss -ulnpH 2>/dev/null | head -50 | while IFS= read -r line; do
+    addr=$(printf '%s' "$line" | awk '{print $4}')
+    proc=$(printf '%s' "$line" | awk '{print $NF}')
+    [ -z "$addr" ] && continue
+    port="${addr##*:}"
+    [ "$first" = "1" ] && first=0 || printf ','
+    printf '{"proto":"udp","addr":"%s","port":%s,"proc":"%s"}' \
+      "$(printf '%s' "${addr%:*}" | json_escape)" "$port" \
+      "$(printf '%s' "$proc" | json_escape)"
+  done
+  printf ']'
+}
+
+inventory_docker() {
+  if ! have docker || ! docker info >/dev/null 2>&1; then
+    printf '"docker":null'
+    return 0
+  fi
+  ver=$(docker version --format '{{.Server.Version}}' 2>/dev/null)
+  printf '"docker":{"version":"%s","containers":[' \
+    "$(printf '%s' "${ver:-unknown}" | json_escape)"
+  first=1
+  # Format with TSV-safe delimiter (we use ASCII 0x1F as delimiter in
+  # the format string).
+  docker ps -a --format '{{.Names}}|{{.Image}}|{{.Status}}|{{.State}}|{{.RunningFor}}|{{.Ports}}|{{.ID}}' 2>/dev/null \
+    | head -50 | while IFS='|' read -r name image status state running ports cid; do
+        [ -z "$name" ] && continue
+        [ "$first" = "1" ] && first=0 || printf ','
+        printf '{"name":"%s","image":"%s","status":"%s","state":"%s","running":"%s","ports":"%s","id":"%s"}' \
+          "$(printf '%s' "$name" | json_escape)" \
+          "$(printf '%s' "$image" | json_escape)" \
+          "$(printf '%s' "$status" | json_escape)" \
+          "$(printf '%s' "$state" | json_escape)" \
+          "$(printf '%s' "$running" | json_escape)" \
+          "$(printf '%s' "$ports" | json_escape)" \
+          "$(printf '%s' "${cid:0:12}" | json_escape)"
+      done
+  printf ']}'
+}
+
+inventory_podman() {
+  if ! have podman || ! podman info >/dev/null 2>&1; then
+    printf '"podman":null'
+    return 0
+  fi
+  ver=$(podman version --format '{{.Server.Version}}' 2>/dev/null || podman version --format '{{.Version}}' 2>/dev/null)
+  printf '"podman":{"version":"%s","containers":[' \
+    "$(printf '%s' "${ver:-unknown}" | json_escape)"
+  first=1
+  podman ps -a --format '{{.Names}}|{{.Image}}|{{.Status}}|{{.State}}|{{.ID}}' 2>/dev/null \
+    | head -50 | while IFS='|' read -r name image status state cid; do
+        [ -z "$name" ] && continue
+        [ "$first" = "1" ] && first=0 || printf ','
+        printf '{"name":"%s","image":"%s","status":"%s","state":"%s","id":"%s"}' \
+          "$(printf '%s' "$name" | json_escape)" \
+          "$(printf '%s' "$image" | json_escape)" \
+          "$(printf '%s' "$status" | json_escape)" \
+          "$(printf '%s' "$state" | json_escape)" \
+          "$(printf '%s' "${cid:0:12}" | json_escape)"
+      done
+  printf ']}'
+}
+
+inventory_libvirt() {
+  if ! have virsh || ! virsh list --all >/dev/null 2>&1; then
+    printf '"libvirt":null'
+    return 0
+  fi
+  ver=$(virsh --version 2>/dev/null)
+  printf '"libvirt":{"version":"%s","vms":[' \
+    "$(printf '%s' "${ver:-unknown}" | json_escape)"
+  first=1
+  virsh list --all 2>/dev/null | awk 'NR>2 && NF>=3 { print }' | while IFS= read -r line; do
+    name=$(printf '%s' "$line" | awk '{print $2}')
+    state=$(printf '%s' "$line" | awk '{ for(i=3;i<=NF;i++) printf "%s ", $i; print "" }')
+    [ -z "$name" ] || [ "$name" = "-" ] && continue
+    state=$(printf '%s' "$state" | sed 's/[ \t]*$//')
+    cpus=""
+    mem=""
+    if [ "$state" = "running" ]; then
+      info=$(virsh dominfo "$name" 2>/dev/null) || info=""
+      cpus=$(printf '%s' "$info" | awk -F: '/CPU\(s\)/{gsub(/[ \t]/,"",$2); print $2; exit}')
+      mem=$(printf '%s' "$info" | awk -F: '/Used memory/{gsub(/[ \t]/,"",$2); sub(/KiB$/,"",$2); print $2*1024; exit}')
+    fi
+    [ "$first" = "1" ] && first=0 || printf ','
+    printf '{"name":"%s","state":"%s","cpus":%s,"mem_bytes":%s}' \
+      "$(printf '%s' "$name" | json_escape)" \
+      "$(printf '%s' "$state" | json_escape)" \
+      "${cpus:-0}" "${mem:-0}"
+  done
+  printf ']}'
+}
+
+inventory_failed_services() {
+  if ! have systemctl; then
+    printf '"failed_services":[]'
+    return 0
+  fi
+  printf '"failed_services":['
+  first=1
+  systemctl list-units --type=service --state=failed --no-pager --no-legend --plain 2>/dev/null \
+    | head -50 | awk '{
+        unit=$1; load=$2; active=$3; sub_=$4;
+        printf "%s\037%s\037%s\n", unit, active, sub_
+      }' | while IFS= read -r line; do
+    unit=$(printf '%s' "$line" | awk -F '\037' '{print $1}')
+    active=$(printf '%s' "$line" | awk -F '\037' '{print $2}')
+    sub_=$(printf '%s' "$line" | awk -F '\037' '{print $3}')
+    [ -z "$unit" ] && continue
+    [ "$first" = "1" ] && first=0 || printf ','
+    printf '{"unit":"%s","active":"%s","sub":"%s"}' \
+      "$(printf '%s' "$unit" | json_escape)" \
+      "$(printf '%s' "$active" | json_escape)" \
+      "$(printf '%s' "$sub_" | json_escape)"
+  done
+  printf ']'
+}
+
+inventory_sensors() {
+  if ! have sensors; then printf '"sensors":[]'; return 0; fi
+  printf '"sensors":['
+  first=1
+  collect_temps | while IFS= read -r line; do
+    base="${line%%\{*}"
+    rest="${line#*\{}"
+    rest="${rest%%\}*}"
+    label=$(printf '%s' "$rest" | sed 's/^name="//; s/"$//')
+    val="${line##*=}"
+    [ "$first" = "1" ] && first=0 || printf ','
+    printf '{"kind":"%s","name":"%s","value":%s}' \
+      "$(printf '%s' "$base" | sed 's/^sensor_//' | json_escape)" \
+      "$(printf '%s' "$label" | json_escape)" "$val"
+  done
+  printf ']'
+}
+
+inventory_kernel() {
   os_id="unknown"; os_version="unknown"; os_pretty=""
   if [ -r /etc/os-release ]; then
     os_id="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-unknown}")"
@@ -144,31 +553,40 @@ collect_inventory() {
   arch="$(uname -m 2>/dev/null || printf 'unknown')"
   cpus="$(nproc 2>/dev/null || awk '/^processor/{n++} END{print n+0}' /proc/cpuinfo)"
   cpu_model="$(awk -F: '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null | sed 's/^ *//')"
-
-  printf '"os_id":"%s","os_version":"%s","os_pretty":"%s","kernel":"%s","arch":"%s","cpus":%d' \
+  virt=""
+  if have systemd-detect-virt; then virt="$(systemd-detect-virt 2>/dev/null || printf '')"; fi
+  boot_id=""
+  [ -r /proc/sys/kernel/random/boot_id ] && boot_id="$(cat /proc/sys/kernel/random/boot_id)"
+  printf '"os_id":"%s","os_version":"%s","os_pretty":"%s","kernel":"%s","arch":"%s","cpus":%d,"virt":"%s","boot_id":"%s"' \
     "$(printf '%s' "$os_id"     | json_escape)" \
     "$(printf '%s' "$os_version" | json_escape)" \
     "$(printf '%s' "$os_pretty"  | json_escape)" \
     "$(printf '%s' "$kernel"     | json_escape)" \
     "$(printf '%s' "$arch"       | json_escape)" \
-    "${cpus:-0}"
+    "${cpus:-0}" \
+    "$(printf '%s' "$virt"       | json_escape)" \
+    "$(printf '%s' "$boot_id"    | json_escape)"
   if [ -n "$cpu_model" ]; then
     printf ',"cpu_model":"%s"' "$(printf '%s' "$cpu_model" | json_escape)"
   fi
 }
 
-collect_services() {
-  command -v systemctl >/dev/null 2>&1 || return 0
+# ---------------------------------------------------------------------------
+# Services + logins (back-compat events).
+# ---------------------------------------------------------------------------
+
+collect_services_event() {
+  have systemctl || return 0
   systemctl list-units --type=service --state=loaded --no-pager --no-legend --plain 2>/dev/null \
     | awk '{
         unit=$1; load=$2; active=$3; sub_=$4;
         if (NF<4) next;
         printf "%s\037%s\037%s\037%s\n", unit, load, active, sub_
-      }' | head -200
+      }' | head -"$PR_SERVICES_MAX"
 }
 
-collect_logins() {
-  command -v lastlog >/dev/null 2>&1 || return 0
+collect_logins_event() {
+  have who || return 0
   who 2>/dev/null | awk '{
     user=$1; line=$2; ts=$3" "$4; from="";
     if (NF>=5) for (i=5;i<=NF;i++) from=from $i" ";
@@ -178,7 +596,7 @@ collect_logins() {
 }
 
 # ---------------------------------------------------------------------------
-# Build payload JSON. We avoid jq (no hard dep): templated strings instead.
+# Build payload.
 # ---------------------------------------------------------------------------
 
 build_payload() {
@@ -186,23 +604,28 @@ build_payload() {
   agent_name_esc="$(printf '%s' "$PR_AGENT_NAME" | json_escape)"
   agent_ver_esc="$(printf '%s' "$PR_AGENT_VERSION" | json_escape)"
 
-  inv_body="$(collect_inventory)"
-
   metrics=""
   for raw in \
     "$(collect_cpu)" \
     "$(collect_load)" \
     "$(collect_mem)" \
     "$(collect_disk)" \
+    "$(collect_diskio)" \
     "$(collect_net)" \
-    "$(collect_uptime)"
+    "$(collect_sockets)" \
+    "$(collect_files)" \
+    "$(collect_uptime)" \
+    "$(collect_users)" \
+    "$(collect_proc_counts)" \
+    "$(collect_temps)" \
+    "$(collect_systemd_counts)" \
+    "$(collect_docker_metrics)" \
+    "$(collect_podman_metrics)" \
+    "$(collect_libvirt_metrics)"
   do
     [ -n "$raw" ] || continue
     while IFS= read -r line; do
       [ -n "$line" ] || continue
-      # Lines look like either `name=value` or `name{k="v"[,k2="v2"]}=value`.
-      # Use non-greedy parameter expansion to split on the LAST `=` so the
-      # `=` inside label values doesn't break the parse.
       key="${line%=*}"; val="${line##*=}"
       base="${key%%\{*}"
       labels=""
@@ -228,7 +651,7 @@ EOF_LINES
   done
 
   services=""
-  raw_svc="$(collect_services || true)"
+  raw_svc="$(collect_services_event || true)"
   if [ -n "$raw_svc" ]; then
     first=1
     while IFS= read -r line; do
@@ -245,7 +668,7 @@ EOF_SVC
   fi
 
   logins=""
-  raw_lgn="$(collect_logins || true)"
+  raw_lgn="$(collect_logins_event || true)"
   if [ -n "$raw_lgn" ]; then
     first=1
     while IFS= read -r line; do
@@ -261,13 +684,25 @@ $raw_lgn
 EOF_LGN
   fi
 
+  # Inventory blob — a single JSON object with all snapshot data.
+  cap="$(inventory_capabilities)"
+  kern="$(inventory_kernel)"
+  procs="$(inventory_top_processes)"
+  ports="$(inventory_listening_ports)"
+  dock="$(inventory_docker)"
+  pman="$(inventory_podman)"
+  lvirt="$(inventory_libvirt)"
+  failed="$(inventory_failed_services)"
+  snsr="$(inventory_sensors)"
+
   {
     printf '{'
     printf '"agent_id":"%s",' "$PR_AGENT_ID"
     printf '"name":"%s",' "$agent_name_esc"
     printf '"agent_version":"%s",' "$agent_ver_esc"
     printf '"ts":"%s",' "$ts"
-    printf '"inventory":{%s},' "$inv_body"
+    printf '"inventory":{%s,%s,%s,%s,%s,%s,%s,%s,%s},' \
+      "$kern" "$cap" "$procs" "$ports" "$dock" "$pman" "$lvirt" "$failed" "$snsr"
     printf '"metrics":[%s],' "$metrics"
     printf '"services":[%s],' "$services"
     printf '"logins":[%s]' "$logins"
@@ -276,8 +711,7 @@ EOF_LGN
 }
 
 # ---------------------------------------------------------------------------
-# Queue + send. If the network blip-fails, we drop the payload into the
-# queue dir and try to drain it on the next tick. Bounded by PR_QUEUE_MAX.
+# Queue + send (unchanged from 0.1.0).
 # ---------------------------------------------------------------------------
 
 post_one() {
@@ -315,7 +749,6 @@ drain_queue() {
 enqueue() {
   ts_epoch="$(now_epoch)"; rand="$$$ts_epoch"
   cp -- "$PAYLOAD" "$QUEUE_DIR/q-$ts_epoch-$rand.json"
-  # Trim oldest if we're past PR_QUEUE_MAX.
   count="$(ls -1 "$QUEUE_DIR" 2>/dev/null | wc -l | awk '{print $1}')"
   if [ "$count" -gt "$PR_QUEUE_MAX" ]; then
     drop=$((count - PR_QUEUE_MAX))

@@ -28,7 +28,7 @@ SVC_NAME="pingreports-agent.service"
 TMR_NAME="pingreports-agent.timer"
 DEFAULT_INGEST="https://agents-pr.sxp.dev/v1/ingest"
 
-PR_AGENT_VERSION="0.1.0"
+PR_AGENT_VERSION="0.2.0"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "install.sh must be run as root (sudo)." >&2
@@ -112,6 +112,67 @@ fi
 mkdir -p "$AGENT_HOME" "$AGENT_LIB" "$AGENT_CONF_DIR"
 chown -R "$AGENT_USER:$AGENT_USER" "$AGENT_HOME"
 chmod 0750 "$AGENT_HOME"
+
+# 3b. Optional group memberships for extended metrics. Each is opt-in:
+# - PR_GRANT_DOCKER=1   → docker group (required to read `docker ps/stats`)
+# - PR_GRANT_PODMAN=1   → podman socket group (varies; podman is often rootless)
+# - PR_GRANT_LIBVIRT=1  → libvirt + libvirt-qemu groups (read VM stats)
+# - PR_GRANT_KVM=1      → kvm group (lets the agent see /dev/kvm caps)
+#
+# When stdin is interactive AND the matching group exists on the host AND
+# the relevant tool is installed, prompt; otherwise honour the env flag and
+# default OFF. The agent gracefully skips collectors it can't read.
+maybe_add_group() {
+  flag_name="$1"  # PR_GRANT_DOCKER etc
+  group_name="$2"
+  reason="$3"
+  flag_val=$(eval "printf '%s' \"\${$flag_name:-}\"")
+  if ! getent group "$group_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$flag_val" = "1" ] || [ "$flag_val" = "true" ] || [ "$flag_val" = "yes" ]; then
+    add=1
+  elif [ "$flag_val" = "0" ] || [ "$flag_val" = "false" ] || [ "$flag_val" = "no" ]; then
+    add=0
+  elif [ -t 0 ] && [ -z "$assume_yes" ]; then
+    printf 'Add %s to group "%s"? %s [y/N] ' "$AGENT_USER" "$group_name" "$reason"
+    read -r ans </dev/tty 2>/dev/null || ans=""
+    case "$ans" in y|Y|yes|YES) add=1 ;; *) add=0 ;; esac
+  else
+    add=0
+  fi
+  if [ "$add" = "1" ]; then
+    if usermod -aG "$group_name" "$AGENT_USER" 2>/dev/null; then
+      echo "  + added $AGENT_USER to group $group_name"
+    fi
+  fi
+}
+
+if require docker; then
+  maybe_add_group PR_GRANT_DOCKER docker "(reads container CPU / mem / net stats)"
+fi
+if require podman; then
+  for g in podman containers; do
+    if getent group "$g" >/dev/null 2>&1; then
+      maybe_add_group PR_GRANT_PODMAN "$g" "(reads podman container stats)"
+      break
+    fi
+  done
+fi
+if require virsh; then
+  for g in libvirt libvirtd; do
+    if getent group "$g" >/dev/null 2>&1; then
+      maybe_add_group PR_GRANT_LIBVIRT "$g" "(reads VM list + per-VM CPU / mem)"
+      break
+    fi
+  done
+  if getent group libvirt-qemu >/dev/null 2>&1; then
+    maybe_add_group PR_GRANT_LIBVIRT libvirt-qemu "(reads QEMU process info)"
+  fi
+fi
+if [ -e /dev/kvm ]; then
+  maybe_add_group PR_GRANT_KVM kvm "(detect KVM accel availability)"
+fi
 
 # 4. agent binary (this script's sibling). The installer ships agent.sh
 # either alongside itself (curl-piped install pulls it via INSTALL_SOURCE_URL)
@@ -218,6 +279,7 @@ echo "PingReports agent installed."
 echo "  config : $AGENT_CONF"
 echo "  binary : $AGENT_LIB/agent.sh"
 echo "  user   : $AGENT_USER"
+echo "  groups : $(id -nG "$AGENT_USER" 2>/dev/null | tr ' ' ',')"
 echo "  schedule: every 5min (boot offset ${OFFSET_S}s + ${RANDOM_DELAY_S}s jitter)"
 echo "  status : systemctl status $TMR_NAME"
 echo "  logs   : journalctl -u $SVC_NAME -f"
