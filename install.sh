@@ -294,3 +294,29 @@ echo "  groups : $(id -nG "$AGENT_USER" 2>/dev/null | tr ' ' ',')"
 echo "  schedule: every 5min (boot offset ${OFFSET_S}s + ${RANDOM_DELAY_S}s jitter)"
 echo "  status : systemctl status $TMR_NAME"
 echo "  logs   : journalctl -u $SVC_NAME -f"
+
+# Post-install advisory: when curl|sh runs without a TTY, the optional
+# group prompts above default to NO. If we detect any of the binaries on
+# the host but the agent user isn't in the matching group, point the
+# operator at the exact one-liner to enable extended collectors.
+missing=""
+agent_groups="$(id -nG "$AGENT_USER" 2>/dev/null || true)"
+in_group() { case " $agent_groups " in *" $1 "*) return 0 ;; esac; return 1; }
+if command -v docker >/dev/null 2>&1 && ! in_group docker; then
+  missing="$missing docker"
+fi
+if command -v virsh >/dev/null 2>&1 && getent group libvirt >/dev/null 2>&1 && ! in_group libvirt; then
+  missing="$missing libvirt"
+fi
+if [ -e /dev/kvm ] && getent group kvm >/dev/null 2>&1 && ! in_group kvm; then
+  missing="$missing kvm"
+fi
+if [ -n "$missing" ]; then
+  echo ""
+  echo "  ⚠ Detected on host but agent user is NOT in the matching group:"
+  for g in $missing; do echo "      - $g"; done
+  echo "    Without these groups the agent can't read containers / VMs / KVM caps."
+  echo "    To enable, run:"
+  printf '      sudo usermod -aG %s %s\n' "$(echo "$missing" | sed 's/^ //; s/ /,/g')" "$AGENT_USER"
+  echo "      sudo systemctl restart $TMR_NAME"
+fi

@@ -447,17 +447,38 @@ collect_libvirt_metrics() {
 # ---------------------------------------------------------------------------
 
 inventory_capabilities() {
-  has_docker=false; have docker && docker info >/dev/null 2>&1 && has_docker=true
-  has_podman=false; have podman && podman info >/dev/null 2>&1 && has_podman=true
-  has_libvirt=false; have virsh && virsh list --all >/dev/null 2>&1 && has_libvirt=true
-  has_kvm=false; [ -r /dev/kvm ] && has_kvm=true
+  # Two-state probe per capability: present (binary or device exists) and
+  # accessible (we can actually use it as the agent's user). Agents
+  # installed via `curl|sh` without an interactive TTY skip the optional
+  # group-membership prompts (docker / libvirt / podman / kvm), so a
+  # libvirt-host can end up with virsh on PATH but pingreports-agent NOT
+  # in the libvirt group → present=true, accessible=false. The UI uses
+  # that gap to show "permission denied — run `usermod -aG libvirt
+  # pingreports-agent && systemctl restart pingreports-agent.timer`".
+  has_docker=false; docker_present=false
+  have docker && docker_present=true && docker info >/dev/null 2>&1 && has_docker=true
+  has_podman=false; podman_present=false
+  have podman && podman_present=true && podman info >/dev/null 2>&1 && has_podman=true
+  has_libvirt=false; libvirt_present=false
+  if have virsh && { [ -S /var/run/libvirt/libvirt-sock ] || [ -S /var/run/libvirt/libvirt-sock-ro ] || pgrep -x libvirtd >/dev/null 2>&1; }; then
+    libvirt_present=true
+  fi
+  if [ "$libvirt_present" = "true" ] && virsh list --all >/dev/null 2>&1; then
+    has_libvirt=true
+  fi
+  has_kvm=false; kvm_present=false
+  [ -e /dev/kvm ] && kvm_present=true && [ -r /dev/kvm ] && has_kvm=true
   has_sensors=false; have sensors && sensors -A >/dev/null 2>&1 && has_sensors=true
   has_systemd=false; have systemctl && has_systemd=true
   has_gpu=false; (have nvidia-smi && nvidia-smi -L >/dev/null 2>&1) && has_gpu=true
   has_apt=false; have apt-get && has_apt=true
   has_dnf=false; have dnf && has_dnf=true
-  printf '"capabilities":{"docker":%s,"podman":%s,"libvirt":%s,"kvm":%s,"sensors":%s,"systemd":%s,"gpu":%s,"apt":%s,"dnf":%s}' \
+  # Emit capabilities + a parallel "present" map so UI can highlight
+  # binary-installed-but-permission-denied capabilities.
+  printf '"capabilities":{"docker":%s,"podman":%s,"libvirt":%s,"kvm":%s,"sensors":%s,"systemd":%s,"gpu":%s,"apt":%s,"dnf":%s},' \
     "$has_docker" "$has_podman" "$has_libvirt" "$has_kvm" "$has_sensors" "$has_systemd" "$has_gpu" "$has_apt" "$has_dnf"
+  printf '"capability_present":{"docker":%s,"podman":%s,"libvirt":%s,"kvm":%s}' \
+    "$docker_present" "$podman_present" "$libvirt_present" "$kvm_present"
 }
 
 # Note: the systemd-unit lookup is now inlined into _proc_extra_json with
