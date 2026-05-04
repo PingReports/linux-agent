@@ -310,6 +310,49 @@ collect_podman_metrics() {
     "${running:-0}" "${total:-0}" "${images:-0}"
 }
 
+collect_proc_metrics() {
+  # Per-comm time-series metrics for the drill-down. We sum across all
+  # PIDs of the same comm so the chart stays continuous when a process
+  # restarts and gets a new pid. Top-N by CPU only — bound cardinality.
+  ps -eo pcpu,pmem,rss,comm --no-headers 2>/dev/null \
+    | awk -v top="$PR_TOP_N" '
+        {
+          sub(/^[ \t]+/, "")
+          pcpu=$1; pmem=$2; rss=$3; comm=$4
+          if (comm == "ps" || comm == "awk" || comm == "sort" || comm == "sed" \
+              || comm == "agent.sh" || comm == "logger" || comm == "wc" \
+              || comm == "tail" || comm == "head" || comm == "tr" \
+              || comm == "cut" || comm == "mktemp" || comm == "rm") next
+          # Sanitise comm for label (CH LowCardinality(String) accepts any
+          # string but we keep a-z0-9_.- only for safety + readability).
+          gsub(/[^a-zA-Z0-9_.-]/, "_", comm)
+          if (length(comm) == 0) next
+          cpu_by[comm] += pcpu + 0
+          mem_by[comm] += pmem + 0
+          rss_by[comm] += rss + 0
+        }
+        END {
+          # Pick top-N by CPU then top-N by RSS, dedup by comm.
+          n=0
+          for (c in cpu_by) { sorted_cpu[++n] = cpu_by[c] "\t" c }
+          # Insertion sort desc — small N
+          for (i=2; i<=n; i++) {
+            x = sorted_cpu[i]; split(x, p, "\t"); xv = p[1] + 0
+            j = i - 1
+            while (j >= 1) { split(sorted_cpu[j], q, "\t"); if (q[1] + 0 < xv) { sorted_cpu[j+1] = sorted_cpu[j]; j-- } else break }
+            sorted_cpu[j+1] = x
+          }
+          # Emit top-N
+          for (i=1; i<=n && i<=top; i++) {
+            split(sorted_cpu[i], p, "\t")
+            c = p[2]
+            printf "proc_cpu_pct{comm=\"%s\"}=%s\n", c, cpu_by[c]
+            printf "proc_mem_pct{comm=\"%s\"}=%s\n", c, mem_by[c]
+            printf "proc_rss_kb{comm=\"%s\"}=%s\n",  c, rss_by[c]
+          }
+        }'
+}
+
 collect_gpu_metrics() {
   # NVIDIA via nvidia-smi. Each line: idx,util_pct,mem_used_mb,mem_total_mb,
   # temp_c,power_w,fan_pct,clk_sm,clk_mem.
@@ -461,17 +504,29 @@ _proc_extra_json() {
 inventory_top_processes() {
   # Tab-separated process snapshot (POSIX-portable). Columns:
   # pid \t user \t pcpu \t pmem \t rss \t comm \t args.
+  #
+  # Filter out the agent's own helper processes — ps / awk / sort / sed
+  # / json_escape / agent.sh itself ALWAYS show up at the top of the CPU
+  # list because they are running while we sample. Keeping them in
+  # would make the operator see "pingreports-agent at 100% CPU" instead
+  # of the actual workload.
   src="$(mktemp)"
   ps -eo pid,user:20,pcpu,pmem,rss,comm,args --no-headers 2>/dev/null \
-    | awk '{
-        sub(/^[ \t]+/, "")
-        pid=$1; user=$2; pcpu=$3; pmem=$4; rss=$5; comm=$6
-        $1=$2=$3=$4=$5=$6=""
-        sub(/^[ \t]+/, "")
-        args=$0
-        gsub(/\t/, " ", args)
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", pid, user, pcpu, pmem, rss, comm, args
-      }' > "$src"
+    | awk -v me="$$" '
+        {
+          sub(/^[ \t]+/, "")
+          pid=$1; user=$2; pcpu=$3; pmem=$4; rss=$5; comm=$6
+          if (user == "pingreports+" || user == "pingreports-agent") next
+          if (comm == "ps" || comm == "awk" || comm == "sort" || comm == "sed" \
+              || comm == "agent.sh" || comm == "json_escape" || comm == "logger" \
+              || comm == "wc" || comm == "tail" || comm == "head" || comm == "tr" \
+              || comm == "cut" || comm == "mktemp" || comm == "rm") next
+          $1=$2=$3=$4=$5=$6=""
+          sub(/^[ \t]+/, "")
+          args=$0
+          gsub(/\t/, " ", args)
+          printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", pid, user, pcpu, pmem, rss, comm, args
+        }' > "$src"
 
   emit_proc_array() {
     sort_key="$1"  # 3 = pcpu, 5 = rss
@@ -945,7 +1000,8 @@ build_payload() {
     "$(collect_podman_metrics)" \
     "$(collect_libvirt_metrics)" \
     "$(collect_gpu_metrics)" \
-    "$(collect_pending_updates)"
+    "$(collect_pending_updates)" \
+    "$(collect_proc_metrics)"
   do
     [ -n "$raw" ] || continue
     while IFS= read -r line; do
