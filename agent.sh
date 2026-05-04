@@ -408,53 +408,54 @@ inventory_capabilities() {
     "$has_docker" "$has_podman" "$has_libvirt" "$has_kvm" "$has_sensors" "$has_systemd" "$has_gpu" "$has_apt" "$has_dnf"
 }
 
-_systemd_unit_for_pid() {
-  # Resolve the systemd unit owning <pid> via /proc/<pid>/cgroup. The v2
-  # format on a systemd host is `0::/system.slice/<unit>.service` for
-  # services and `0::/user.slice/user-1000.slice/...` for user sessions.
-  pid="$1"
-  [ -r "/proc/$pid/cgroup" ] || { printf ''; return; }
-  awk -F: '$1=="0" || $2=="name=systemd" {
-    p=$3
-    n=split(p, parts, "/")
-    for (i=n;i>=1;i--) {
-      if (parts[i] ~ /\.(service|scope|target|socket|timer|mount|slice)$/) {
-        print parts[i]; exit
-      }
-    }
-  }' "/proc/$pid/cgroup" 2>/dev/null
-}
+# Note: the systemd-unit lookup is now inlined into _proc_extra_json with
+# the same `set +e` safety net so a single bad cgroup file can't fail the
+# whole batch.
 
 _proc_extra_json() {
   # Emit JSON fragments for /proc/<pid>/{status,io,fd}. Best-effort —
-  # missing files are silently dropped.
+  # /proc/<pid>/io requires ptrace privileges even for same-uid access on
+  # most kernels, so silently fall back to zero. We disable `set -e`
+  # locally so any awk/ls EACCES is just an empty value, not a fatal exit.
+  set +e
   pid="$1"
-  threads=""
-  state=""
-  num_fds=""
-  ctxt_voluntary=""
-  ctxt_nonvoluntary=""
-  read_bytes=""
-  write_bytes=""
+  threads=0
+  state="?"
+  num_fds=0
+  ctxt_voluntary=0
+  ctxt_nonvoluntary=0
+  read_bytes=0
+  write_bytes=0
   if [ -r "/proc/$pid/status" ]; then
-    threads=$(awk '/^Threads:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)
-    state=$(awk '/^State:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)
-    ctxt_voluntary=$(awk '/^voluntary_ctxt_switches:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)
-    ctxt_nonvoluntary=$(awk '/^nonvoluntary_ctxt_switches:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)
+    t=$(awk '/^Threads:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null) ; [ -n "$t" ] && threads="$t"
+    s=$(awk '/^State:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null) ; [ -n "$s" ] && state="$s"
+    cv=$(awk '/^voluntary_ctxt_switches:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null) ; [ -n "$cv" ] && ctxt_voluntary="$cv"
+    cn=$(awk '/^nonvoluntary_ctxt_switches:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null) ; [ -n "$cn" ] && ctxt_nonvoluntary="$cn"
   fi
   if [ -r "/proc/$pid/io" ]; then
-    read_bytes=$(awk '/^read_bytes:/{print $2; exit}' "/proc/$pid/io" 2>/dev/null)
-    write_bytes=$(awk '/^write_bytes:/{print $2; exit}' "/proc/$pid/io" 2>/dev/null)
+    rb=$(awk '/^read_bytes:/{print $2; exit}' "/proc/$pid/io" 2>/dev/null) ; [ -n "$rb" ] && read_bytes="$rb"
+    wb=$(awk '/^write_bytes:/{print $2; exit}' "/proc/$pid/io" 2>/dev/null) ; [ -n "$wb" ] && write_bytes="$wb"
   fi
   if [ -d "/proc/$pid/fd" ]; then
-    num_fds=$(ls -1 "/proc/$pid/fd" 2>/dev/null | wc -l | awk '{print $1}')
+    n=$(ls -1 "/proc/$pid/fd" 2>/dev/null | wc -l | awk '{print $1}') ; [ -n "$n" ] && num_fds="$n"
   fi
-  unit=$(_systemd_unit_for_pid "$pid")
+  unit=""
+  if [ -r "/proc/$pid/cgroup" ]; then
+    unit=$(awk -F: '$1=="0" || $2=="name=systemd" {
+        p=$3; n=split(p, parts, "/")
+        for (i=n;i>=1;i--) {
+          if (parts[i] ~ /\.(service|scope|target|socket|timer|mount|slice)$/) {
+            print parts[i]; exit
+          }
+        }
+      }' "/proc/$pid/cgroup" 2>/dev/null)
+  fi
   printf '"threads":%s,"state":"%s","fds":%s,"ctxt_v":%s,"ctxt_nv":%s,"io_read_bytes":%s,"io_write_bytes":%s,"unit":"%s"' \
-    "${threads:-0}" "${state:-?}" "${num_fds:-0}" \
-    "${ctxt_voluntary:-0}" "${ctxt_nonvoluntary:-0}" \
-    "${read_bytes:-0}" "${write_bytes:-0}" \
+    "$threads" "$state" "$num_fds" \
+    "$ctxt_voluntary" "$ctxt_nonvoluntary" \
+    "$read_bytes" "$write_bytes" \
     "$(printf '%s' "$unit" | json_escape)"
+  set -e
 }
 
 inventory_top_processes() {
