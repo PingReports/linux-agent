@@ -24,7 +24,7 @@ die() { log "ERROR: $1"; exit 1; }
 : "${PR_AGENT_TOKEN:?PR_AGENT_TOKEN missing}"
 : "${PR_INGEST_URL:?PR_INGEST_URL missing}"
 PR_AGENT_NAME="${PR_AGENT_NAME:-$(hostname)}"
-PR_AGENT_VERSION="${PR_AGENT_VERSION:-0.2.0}"
+PR_AGENT_VERSION="${PR_AGENT_VERSION:-0.3.0}"
 PR_NET_IFACES="${PR_NET_IFACES:-}"
 PR_DISK_PATHS="${PR_DISK_PATHS:-/}"
 PR_HTTP_TIMEOUT="${PR_HTTP_TIMEOUT:-30}"
@@ -310,6 +310,69 @@ collect_podman_metrics() {
     "${running:-0}" "${total:-0}" "${images:-0}"
 }
 
+collect_gpu_metrics() {
+  # NVIDIA via nvidia-smi. Each line: idx,util_pct,mem_used_mb,mem_total_mb,
+  # temp_c,power_w,fan_pct,clk_sm,clk_mem.
+  if have nvidia-smi; then
+    nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,fan.speed,clocks.sm,clocks.mem,utilization.memory \
+               --format=csv,noheader,nounits 2>/dev/null \
+      | while IFS=, read -r idx util mem_u mem_t temp pwr fan clk_sm clk_mem util_mem; do
+          idx=$(printf '%s' "$idx" | tr -d '[:space:]')
+          [ -z "$idx" ] && continue
+          util=$(printf '%s' "$util" | tr -d '[:space:]'); [ -z "$util" ] || [ "$util" = "[N/A]" ] && util=0
+          util_mem=$(printf '%s' "$util_mem" | tr -d '[:space:]'); [ -z "$util_mem" ] || [ "$util_mem" = "[N/A]" ] && util_mem=0
+          mem_u=$(printf '%s' "$mem_u" | tr -d '[:space:]'); [ -z "$mem_u" ] || [ "$mem_u" = "[N/A]" ] && mem_u=0
+          mem_t=$(printf '%s' "$mem_t" | tr -d '[:space:]'); [ -z "$mem_t" ] || [ "$mem_t" = "[N/A]" ] && mem_t=0
+          temp=$(printf '%s' "$temp" | tr -d '[:space:]'); [ -z "$temp" ] || [ "$temp" = "[N/A]" ] && temp=0
+          pwr=$(printf '%s' "$pwr" | tr -d '[:space:]'); [ -z "$pwr" ] || [ "$pwr" = "[N/A]" ] && pwr=0
+          fan=$(printf '%s' "$fan" | tr -d '[:space:]'); [ -z "$fan" ] || [ "$fan" = "[N/A]" ] && fan=0
+          clk_sm=$(printf '%s' "$clk_sm" | tr -d '[:space:]'); [ -z "$clk_sm" ] || [ "$clk_sm" = "[N/A]" ] && clk_sm=0
+          clk_mem=$(printf '%s' "$clk_mem" | tr -d '[:space:]'); [ -z "$clk_mem" ] || [ "$clk_mem" = "[N/A]" ] && clk_mem=0
+          mem_u_b=$(awk -v v="$mem_u" 'BEGIN{printf "%d", v*1048576}')
+          mem_t_b=$(awk -v v="$mem_t" 'BEGIN{printf "%d", v*1048576}')
+          printf 'gpu_util_pct{idx="%s",vendor="nvidia"}=%s\n' "$idx" "$util"
+          printf 'gpu_mem_util_pct{idx="%s",vendor="nvidia"}=%s\n' "$idx" "$util_mem"
+          printf 'gpu_mem_used_bytes{idx="%s",vendor="nvidia"}=%s\n' "$idx" "$mem_u_b"
+          printf 'gpu_mem_total_bytes{idx="%s",vendor="nvidia"}=%s\n' "$idx" "$mem_t_b"
+          printf 'gpu_temp_c{idx="%s",vendor="nvidia"}=%s\n' "$idx" "$temp"
+          printf 'gpu_power_w{idx="%s",vendor="nvidia"}=%s\n' "$idx" "$pwr"
+          printf 'gpu_fan_pct{idx="%s",vendor="nvidia"}=%s\n' "$idx" "$fan"
+          printf 'gpu_clock_sm_mhz{idx="%s",vendor="nvidia"}=%s\n' "$idx" "$clk_sm"
+          printf 'gpu_clock_mem_mhz{idx="%s",vendor="nvidia"}=%s\n' "$idx" "$clk_mem"
+        done
+  fi
+  # AMD GPUs via rocm-smi (if ROCm installed). Lighter coverage; not a goal
+  # for v0.3.0 — leave as a stub the next bump can fill.
+  :
+}
+
+collect_pending_updates() {
+  # Returns three counters — total updatable, security-flagged subset, and
+  # whether a reboot is required. Cached by the package manager so this
+  # is cheap per push.
+  if have apt-get && [ -r /var/lib/apt/lists ]; then
+    total=$(apt list --upgradable 2>/dev/null | tail -n +2 | wc -l | awk '{print $1}')
+    sec=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -ic 'security' || true)
+    [ -z "$sec" ] && sec=0
+    printf 'updates_pending=%s\nupdates_security=%s\n' "${total:-0}" "${sec:-0}"
+  elif have dnf; then
+    total=$(dnf -q check-update 2>/dev/null | grep -Ec '^[a-zA-Z]' || true)
+    sec=$(dnf -q check-update --security 2>/dev/null | grep -Ec '^[a-zA-Z]' || true)
+    printf 'updates_pending=%s\nupdates_security=%s\n' "${total:-0}" "${sec:-0}"
+  elif have yum; then
+    total=$(yum -q check-update 2>/dev/null | grep -Ec '^[a-zA-Z]' || true)
+    printf 'updates_pending=%s\nupdates_security=0\n' "${total:-0}"
+  elif have zypper; then
+    total=$(zypper -q list-updates 2>/dev/null | grep -c '^v ' || true)
+    printf 'updates_pending=%s\nupdates_security=0\n' "${total:-0}"
+  fi
+  if [ -e /var/run/reboot-required ] || [ -e /run/reboot-required ]; then
+    printf 'reboot_required=1\n'
+  else
+    printf 'reboot_required=0\n'
+  fi
+}
+
 collect_libvirt_metrics() {
   have virsh || return 0
   virsh list --all >/dev/null 2>&1 || return 0
@@ -338,14 +401,65 @@ inventory_capabilities() {
   has_kvm=false; [ -r /dev/kvm ] && has_kvm=true
   has_sensors=false; have sensors && sensors -A >/dev/null 2>&1 && has_sensors=true
   has_systemd=false; have systemctl && has_systemd=true
-  printf '"capabilities":{"docker":%s,"podman":%s,"libvirt":%s,"kvm":%s,"sensors":%s,"systemd":%s}' \
-    "$has_docker" "$has_podman" "$has_libvirt" "$has_kvm" "$has_sensors" "$has_systemd"
+  has_gpu=false; (have nvidia-smi && nvidia-smi -L >/dev/null 2>&1) && has_gpu=true
+  has_apt=false; have apt-get && has_apt=true
+  has_dnf=false; have dnf && has_dnf=true
+  printf '"capabilities":{"docker":%s,"podman":%s,"libvirt":%s,"kvm":%s,"sensors":%s,"systemd":%s,"gpu":%s,"apt":%s,"dnf":%s}' \
+    "$has_docker" "$has_podman" "$has_libvirt" "$has_kvm" "$has_sensors" "$has_systemd" "$has_gpu" "$has_apt" "$has_dnf"
+}
+
+_systemd_unit_for_pid() {
+  # Resolve the systemd unit owning <pid> via /proc/<pid>/cgroup. The v2
+  # format on a systemd host is `0::/system.slice/<unit>.service` for
+  # services and `0::/user.slice/user-1000.slice/...` for user sessions.
+  pid="$1"
+  [ -r "/proc/$pid/cgroup" ] || { printf ''; return; }
+  awk -F: '$1=="0" || $2=="name=systemd" {
+    p=$3
+    n=split(p, parts, "/")
+    for (i=n;i>=1;i--) {
+      if (parts[i] ~ /\.(service|scope|target|socket|timer|mount|slice)$/) {
+        print parts[i]; exit
+      }
+    }
+  }' "/proc/$pid/cgroup" 2>/dev/null
+}
+
+_proc_extra_json() {
+  # Emit JSON fragments for /proc/<pid>/{status,io,fd}. Best-effort —
+  # missing files are silently dropped.
+  pid="$1"
+  threads=""
+  state=""
+  num_fds=""
+  ctxt_voluntary=""
+  ctxt_nonvoluntary=""
+  read_bytes=""
+  write_bytes=""
+  if [ -r "/proc/$pid/status" ]; then
+    threads=$(awk '/^Threads:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)
+    state=$(awk '/^State:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)
+    ctxt_voluntary=$(awk '/^voluntary_ctxt_switches:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)
+    ctxt_nonvoluntary=$(awk '/^nonvoluntary_ctxt_switches:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null)
+  fi
+  if [ -r "/proc/$pid/io" ]; then
+    read_bytes=$(awk '/^read_bytes:/{print $2; exit}' "/proc/$pid/io" 2>/dev/null)
+    write_bytes=$(awk '/^write_bytes:/{print $2; exit}' "/proc/$pid/io" 2>/dev/null)
+  fi
+  if [ -d "/proc/$pid/fd" ]; then
+    num_fds=$(ls -1 "/proc/$pid/fd" 2>/dev/null | wc -l | awk '{print $1}')
+  fi
+  unit=$(_systemd_unit_for_pid "$pid")
+  printf '"threads":%s,"state":"%s","fds":%s,"ctxt_v":%s,"ctxt_nv":%s,"io_read_bytes":%s,"io_write_bytes":%s,"unit":"%s"' \
+    "${threads:-0}" "${state:-?}" "${num_fds:-0}" \
+    "${ctxt_voluntary:-0}" "${ctxt_nonvoluntary:-0}" \
+    "${read_bytes:-0}" "${write_bytes:-0}" \
+    "$(printf '%s' "$unit" | json_escape)"
 }
 
 inventory_top_processes() {
-  # Tab-separated process snapshot (POSIX-portable; the bash-only `$'\037'`
-  # form fails silently in dash). Columns: pid \t user \t pcpu \t pmem \t
-  # rss \t comm \t args.
+  # Tab-separated process snapshot (POSIX-portable). Columns:
+  # pid \t user \t pcpu \t pmem \t rss \t comm \t args.
   src="$(mktemp)"
   ps -eo pid,user:20,pcpu,pmem,rss,comm,args --no-headers 2>/dev/null \
     | awk '{
@@ -367,12 +481,14 @@ inventory_top_processes() {
       | while IFS='	' read -r pid user pcpu pmem rss comm args; do
           [ -z "$pid" ] && continue
           args_short=$(printf '%s' "$args" | cut -c1-200)
-          printf '{"pid":%s,"user":"%s","cpu":%s,"mem":%s,"rss_kb":%s,"comm":"%s","args":"%s"}\n' \
+          extra=$(_proc_extra_json "$pid")
+          printf '{"pid":%s,"user":"%s","cpu":%s,"mem":%s,"rss_kb":%s,"comm":"%s","args":"%s",%s}\n' \
             "$pid" \
             "$(printf '%s' "$user" | json_escape)" \
             "$pcpu" "$pmem" "$rss" \
             "$(printf '%s' "$comm" | json_escape)" \
-            "$(printf '%s' "$args_short" | json_escape)" >> "$join_tmp"
+            "$(printf '%s' "$args_short" | json_escape)" \
+            "$extra" >> "$join_tmp"
         done
     awk 'NR>1{printf ","} {printf "%s", $0}' "$join_tmp"
     printf ']'
@@ -383,6 +499,158 @@ inventory_top_processes() {
   printf ','
   emit_proc_array 5 "top_proc_mem"
   rm -f "$src"
+}
+
+inventory_systemd_all() {
+  # All loaded units (services + scopes + sockets + timers + targets +
+  # mounts) with their state — capped to a generous-but-bounded list.
+  if ! have systemctl; then printf '"systemd_units":[]'; return 0; fi
+  tmp="$(mktemp)"
+  systemctl list-units --all --no-pager --no-legend --plain 2>/dev/null \
+    | awk -v max="$PR_SERVICES_MAX" '
+        NR>max { exit }
+        NF>=4 {
+          unit=$1; load=$2; active=$3; sub_=$4;
+          desc=""
+          for (i=5; i<=NF; i++) desc = desc (i==5?"":" ") $i
+          gsub(/"/, "\\\"", desc)
+          gsub(/\\/, "\\\\", desc)
+          printf "{\"unit\":\"%s\",\"load\":\"%s\",\"active\":\"%s\",\"sub\":\"%s\",\"desc\":\"%s\"}\n",
+            unit, load, active, sub_, desc
+        }
+      ' > "$tmp"
+  printf '"systemd_units":['
+  awk 'NR>1{printf ","} {printf "%s", $0}' "$tmp"
+  printf ']'
+  rm -f "$tmp"
+}
+
+inventory_established_connections() {
+  if ! have ss; then printf '"established":[]'; return 0; fi
+  tmp="$(mktemp)"
+  # ss columns: state recv-q send-q local-addr:port peer-addr:port [users:(("name",pid=N,fd=N))]
+  ss -tnH state established 2>/dev/null | head -200 \
+    | while IFS= read -r line; do
+        local_addr=$(printf '%s' "$line" | awk '{print $4}')
+        remote_addr=$(printf '%s' "$line" | awk '{print $5}')
+        users=$(printf '%s' "$line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i}')
+        [ -z "$local_addr" ] || [ -z "$remote_addr" ] && continue
+        local_ip="${local_addr%:*}"; local_port="${local_addr##*:}"
+        remote_ip="${remote_addr%:*}"; remote_port="${remote_addr##*:}"
+        # strip [...]
+        case "$local_ip" in \[*]) local_ip="${local_ip#\[}"; local_ip="${local_ip%]}";; esac
+        case "$remote_ip" in \[*]) remote_ip="${remote_ip#\[}"; remote_ip="${remote_ip%]}";; esac
+        proc=$(printf '%s' "$users" | sed -n 's/.*"\([^"]*\)".*/\1/p')
+        printf '{"local_ip":"%s","local_port":%s,"remote_ip":"%s","remote_port":%s,"proc":"%s"}\n' \
+          "$(printf '%s' "$local_ip" | json_escape)" "${local_port:-0}" \
+          "$(printf '%s' "$remote_ip" | json_escape)" "${remote_port:-0}" \
+          "$(printf '%s' "$proc" | json_escape)" >> "$tmp"
+      done
+  printf '"established":['
+  awk 'NR>1{printf ","} {printf "%s", $0}' "$tmp"
+  printf ']'
+  rm -f "$tmp"
+}
+
+inventory_system_info() {
+  # DMI from /sys/class/dmi/id (world-readable on most distros). Fall back
+  # to dmidecode if present and runnable. Includes board / BIOS / chassis
+  # vendor + product + serials redacted.
+  d=/sys/class/dmi/id
+  read_or() { f="$1"; [ -r "$f" ] && head -1 "$f" 2>/dev/null || printf ''; }
+  bios_vendor=$(read_or "$d/bios_vendor")
+  bios_version=$(read_or "$d/bios_version")
+  bios_date=$(read_or "$d/bios_date")
+  board_vendor=$(read_or "$d/board_vendor")
+  board_name=$(read_or "$d/board_name")
+  board_version=$(read_or "$d/board_version")
+  product_name=$(read_or "$d/product_name")
+  product_family=$(read_or "$d/product_family")
+  sys_vendor=$(read_or "$d/sys_vendor")
+  chassis_type=$(read_or "$d/chassis_type")
+  cpus_logical=$(nproc 2>/dev/null || echo 0)
+  cpus_physical=$(awk -F: '/^physical id/{ids[$2]=1} END{c=0; for (k in ids) c++; print c+0}' /proc/cpuinfo 2>/dev/null)
+  [ -z "$cpus_physical" ] || [ "$cpus_physical" = "0" ] && cpus_physical=1
+  cpu_cores=$(awk -F: '/^cpu cores/{print $2; exit}' /proc/cpuinfo 2>/dev/null | tr -d '[:space:]')
+  cpu_model=$(awk -F: '/^model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null | sed 's/^ *//')
+  cpu_flags=""
+  if grep -q '^flags' /proc/cpuinfo 2>/dev/null; then
+    cpu_flags=$(awk -F: '/^flags/{print $2; exit}' /proc/cpuinfo | tr -s ' ' | sed 's/^ //')
+    # cap to 200 chars to keep payload sane
+    cpu_flags=$(printf '%s' "$cpu_flags" | cut -c1-300)
+  fi
+  mem_total_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+  swap_total_kb=$(awk '/^SwapTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+  kernel_cmdline=$([ -r /proc/cmdline ] && head -1 /proc/cmdline 2>/dev/null | cut -c1-300)
+  resolvers=""
+  [ -r /etc/resolv.conf ] && resolvers=$(awk '/^nameserver/{printf "%s%s", sep, $2; sep=","}' /etc/resolv.conf 2>/dev/null | cut -c1-200)
+  ntp_source=""
+  if have timedatectl; then
+    ntp_source=$(timedatectl show -p NTPSynchronized -p Timezone -p ServerName --value 2>/dev/null | tr '\n' ',' | cut -c1-200)
+  fi
+  printf '"system_info":{'
+  printf '"sys_vendor":"%s",'      "$(printf '%s' "$sys_vendor"     | json_escape)"
+  printf '"product_name":"%s",'    "$(printf '%s' "$product_name"   | json_escape)"
+  printf '"product_family":"%s",'  "$(printf '%s' "$product_family" | json_escape)"
+  printf '"board_vendor":"%s",'    "$(printf '%s' "$board_vendor"   | json_escape)"
+  printf '"board_name":"%s",'      "$(printf '%s' "$board_name"     | json_escape)"
+  printf '"board_version":"%s",'   "$(printf '%s' "$board_version"  | json_escape)"
+  printf '"bios_vendor":"%s",'     "$(printf '%s' "$bios_vendor"    | json_escape)"
+  printf '"bios_version":"%s",'    "$(printf '%s' "$bios_version"   | json_escape)"
+  printf '"bios_date":"%s",'       "$(printf '%s' "$bios_date"      | json_escape)"
+  printf '"chassis_type":"%s",'    "$(printf '%s' "$chassis_type"   | json_escape)"
+  printf '"cpu_model":"%s",'       "$(printf '%s' "$cpu_model"      | json_escape)"
+  printf '"cpu_logical":%s,'       "${cpus_logical:-0}"
+  printf '"cpu_physical":%s,'      "${cpus_physical:-1}"
+  printf '"cpu_cores":%s,'         "${cpu_cores:-0}"
+  printf '"mem_total_kb":%s,'      "${mem_total_kb:-0}"
+  printf '"swap_total_kb":%s,'     "${swap_total_kb:-0}"
+  printf '"kernel_cmdline":"%s",'  "$(printf '%s' "$kernel_cmdline" | json_escape)"
+  printf '"resolvers":"%s",'       "$(printf '%s' "$resolvers"      | json_escape)"
+  printf '"ntp_status":"%s",'      "$(printf '%s' "$ntp_source"     | json_escape)"
+  printf '"cpu_flags":"%s"'        "$(printf '%s' "$cpu_flags"      | json_escape)"
+  printf '}'
+}
+
+inventory_gpus() {
+  if ! have nvidia-smi || ! nvidia-smi -L >/dev/null 2>&1; then
+    printf '"gpus":[]'; return 0
+  fi
+  tmp="$(mktemp)"
+  nvidia-smi --query-gpu=index,name,driver_version,vbios_version,uuid,pci.bus_id,memory.total,compute_cap \
+             --format=csv,noheader 2>/dev/null \
+    | while IFS=, read -r idx name drv vbios uuid pci memt ccap; do
+        idx=$(printf '%s' "$idx" | tr -d '[:space:]')
+        [ -z "$idx" ] && continue
+        printf '{"vendor":"nvidia","idx":%s,"name":"%s","driver":"%s","vbios":"%s","uuid":"%s","pci":"%s","mem_total":"%s","compute":"%s"}\n' \
+          "$idx" \
+          "$(printf '%s' "${name#  }"  | json_escape)" \
+          "$(printf '%s' "${drv# }"    | json_escape)" \
+          "$(printf '%s' "${vbios# }"  | json_escape)" \
+          "$(printf '%s' "${uuid# }"   | json_escape)" \
+          "$(printf '%s' "${pci# }"    | json_escape)" \
+          "$(printf '%s' "${memt# }"   | json_escape)" \
+          "$(printf '%s' "${ccap# }"   | json_escape)" >> "$tmp"
+      done
+  printf '"gpus":['
+  awk 'NR>1{printf ","} {printf "%s", $0}' "$tmp"
+  printf ']'
+  rm -f "$tmp"
+}
+
+inventory_pending_updates() {
+  total=0; sec=0; reboot=0
+  if have apt-get && [ -r /var/lib/apt/lists ]; then
+    total=$(apt list --upgradable 2>/dev/null | tail -n +2 | wc -l | awk '{print $1}')
+    sec=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -ic 'security' || true)
+    [ -z "$sec" ] && sec=0
+  elif have dnf; then
+    total=$(dnf -q check-update 2>/dev/null | grep -Ec '^[a-zA-Z0-9]')
+    sec=$(dnf -q check-update --security 2>/dev/null | grep -Ec '^[a-zA-Z0-9]')
+  fi
+  [ -e /var/run/reboot-required ] || [ -e /run/reboot-required ] && reboot=1 || reboot=0
+  printf '"updates":{"total":%s,"security":%s,"reboot_required":%s}' \
+    "${total:-0}" "${sec:-0}" "${reboot:-0}"
 }
 
 inventory_listening_ports() {
@@ -423,23 +691,43 @@ inventory_docker() {
   ver=$(docker version --format '{{.Server.Version}}' 2>/dev/null)
   printf '"docker":{"version":"%s","containers":[' \
     "$(printf '%s' "${ver:-unknown}" | json_escape)"
-  first=1
-  # Format with TSV-safe delimiter (we use ASCII 0x1F as delimiter in
-  # the format string).
+  tmp="$(mktemp)"
   docker ps -a --format '{{.Names}}|{{.Image}}|{{.Status}}|{{.State}}|{{.RunningFor}}|{{.Ports}}|{{.ID}}' 2>/dev/null \
     | head -50 | while IFS='|' read -r name image status state running ports cid; do
         [ -z "$name" ] && continue
-        [ "$first" = "1" ] && first=0 || printf ','
-        printf '{"name":"%s","image":"%s","status":"%s","state":"%s","running":"%s","ports":"%s","id":"%s"}' \
+        # Per-container inspect fields. One docker inspect call per container
+        # is acceptable at this scale (50 max). Pull only safe fields —
+        # never env vars (often carry secrets) or full Mounts list.
+        ins=$(docker inspect --format '{{.State.Health.Status}}|{{.RestartCount}}|{{.HostConfig.NetworkMode}}|{{.Created}}|{{.State.StartedAt}}|{{.State.ExitCode}}|{{len .Mounts}}|{{.Config.Hostname}}' "$cid" 2>/dev/null)
+        IFS='|' read -r health restarts netmode created started exit_code mounts hostname <<EOF_INS
+$ins
+EOF_INS
+        # docker reports "healthy" / "starting" / "unhealthy" or empty when
+        # no HEALTHCHECK is defined; normalise the empty case to "n/a".
+        [ -z "$health" ] || [ "$health" = "<no value>" ] && health="n/a"
+        [ -z "$restarts" ] && restarts=0
+        [ -z "$mounts" ] && mounts=0
+        [ -z "$exit_code" ] && exit_code=0
+        printf '{"name":"%s","image":"%s","status":"%s","state":"%s","running":"%s","ports":"%s","id":"%s","health":"%s","restarts":%s,"netmode":"%s","created":"%s","started":"%s","exit_code":%s,"mounts":%s,"hostname":"%s"}\n' \
           "$(printf '%s' "$name" | json_escape)" \
           "$(printf '%s' "$image" | json_escape)" \
           "$(printf '%s' "$status" | json_escape)" \
           "$(printf '%s' "$state" | json_escape)" \
           "$(printf '%s' "$running" | json_escape)" \
           "$(printf '%s' "$ports" | json_escape)" \
-          "$(printf '%s' "$cid" | cut -c1-12 | json_escape)"
+          "$(printf '%s' "$cid" | cut -c1-12 | json_escape)" \
+          "$(printf '%s' "$health" | json_escape)" \
+          "$restarts" \
+          "$(printf '%s' "$netmode" | json_escape)" \
+          "$(printf '%s' "$created" | cut -c1-25 | json_escape)" \
+          "$(printf '%s' "$started" | cut -c1-25 | json_escape)" \
+          "$exit_code" \
+          "$mounts" \
+          "$(printf '%s' "$hostname" | json_escape)" >> "$tmp"
       done
+  awk 'NR>1{printf ","} {printf "%s", $0}' "$tmp"
   printf ']}'
+  rm -f "$tmp"
 }
 
 inventory_podman() {
@@ -617,7 +905,9 @@ build_payload() {
     "$(collect_systemd_counts)" \
     "$(collect_docker_metrics)" \
     "$(collect_podman_metrics)" \
-    "$(collect_libvirt_metrics)"
+    "$(collect_libvirt_metrics)" \
+    "$(collect_gpu_metrics)" \
+    "$(collect_pending_updates)"
   do
     [ -n "$raw" ] || continue
     while IFS= read -r line; do
@@ -683,13 +973,18 @@ EOF_LGN
   # Inventory blob — a single JSON object with all snapshot data.
   cap="$(inventory_capabilities)"
   kern="$(inventory_kernel)"
+  sysinfo="$(inventory_system_info)"
   procs="$(inventory_top_processes)"
   ports="$(inventory_listening_ports)"
+  estab="$(inventory_established_connections)"
   dock="$(inventory_docker)"
   pman="$(inventory_podman)"
   lvirt="$(inventory_libvirt)"
+  units_all="$(inventory_systemd_all)"
   failed="$(inventory_failed_services)"
   snsr="$(inventory_sensors)"
+  gpus="$(inventory_gpus)"
+  upd="$(inventory_pending_updates)"
 
   {
     printf '{'
@@ -697,8 +992,10 @@ EOF_LGN
     printf '"name":"%s",' "$agent_name_esc"
     printf '"agent_version":"%s",' "$agent_ver_esc"
     printf '"ts":"%s",' "$ts"
-    printf '"inventory":{%s,%s,%s,%s,%s,%s,%s,%s,%s},' \
-      "$kern" "$cap" "$procs" "$ports" "$dock" "$pman" "$lvirt" "$failed" "$snsr"
+    printf '"inventory":{%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s},' \
+      "$kern" "$cap" "$sysinfo" "$procs" "$ports" "$estab" \
+      "$dock" "$pman" "$lvirt" "$units_all" "$failed" "$snsr" \
+      "$gpus" "$upd"
     printf '"metrics":[%s],' "$metrics"
     printf '"services":[%s],' "$services"
     printf '"logins":[%s]' "$logins"
