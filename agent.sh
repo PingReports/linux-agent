@@ -696,19 +696,22 @@ inventory_docker() {
   docker ps -a --format '{{.Names}}|{{.Image}}|{{.Status}}|{{.State}}|{{.RunningFor}}|{{.Ports}}|{{.ID}}' 2>/dev/null \
     | head -50 | while IFS='|' read -r name image status state running ports cid; do
         [ -z "$name" ] && continue
-        # Per-container inspect fields. One docker inspect call per container
-        # is acceptable at this scale (50 max). Pull only safe fields —
-        # never env vars (often carry secrets) or full Mounts list.
-        ins=$(docker inspect --format '{{.State.Health.Status}}|{{.RestartCount}}|{{.HostConfig.NetworkMode}}|{{.Created}}|{{.State.StartedAt}}|{{.State.ExitCode}}|{{len .Mounts}}|{{.Config.Hostname}}' "$cid" 2>/dev/null)
-        IFS='|' read -r health restarts netmode created started exit_code mounts hostname <<EOF_INS
-$ins
-EOF_INS
-        # docker reports "healthy" / "starting" / "unhealthy" or empty when
-        # no HEALTHCHECK is defined; normalise the empty case to "n/a".
-        [ -z "$health" ] || [ "$health" = "<no value>" ] && health="n/a"
-        [ -z "$restarts" ] && restarts=0
-        [ -z "$mounts" ] && mounts=0
-        [ -z "$exit_code" ] && exit_code=0
+        # Per-container inspect fields, fetched one at a time so a single
+        # template-syntax mismatch (older docker versions don't support
+        # `{{len .Mounts}}`) cannot fail the whole row. Each value is
+        # captured independently with `|| true` so an inspect error
+        # under `set -e` is harmless.
+        di() { docker inspect --format "$1" "$cid" 2>/dev/null || true; }
+        health=$(di '{{.State.Health.Status}}'); [ -z "$health" ] || [ "$health" = "<no value>" ] && health="n/a"
+        restarts=$(di '{{.RestartCount}}'); [ -z "$restarts" ] && restarts=0
+        netmode=$(di '{{.HostConfig.NetworkMode}}')
+        created=$(di '{{.Created}}'); created=$(printf '%s' "$created" | cut -c1-25)
+        started=$(di '{{.State.StartedAt}}'); started=$(printf '%s' "$started" | cut -c1-25)
+        exit_code=$(di '{{.State.ExitCode}}'); [ -z "$exit_code" ] && exit_code=0
+        # `len .Mounts` template arg landed in docker 20.x; older releases
+        # would error out, so try-and-degrade.
+        mounts=$(di '{{len .Mounts}}'); case "$mounts" in ''|*[!0-9]*) mounts=0 ;; esac
+        hostname=$(di '{{.Config.Hostname}}')
         printf '{"name":"%s","image":"%s","status":"%s","state":"%s","running":"%s","ports":"%s","id":"%s","health":"%s","restarts":%s,"netmode":"%s","created":"%s","started":"%s","exit_code":%s,"mounts":%s,"hostname":"%s"}\n' \
           "$(printf '%s' "$name" | json_escape)" \
           "$(printf '%s' "$image" | json_escape)" \
