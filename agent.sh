@@ -1135,14 +1135,20 @@ post_one() {
   body_file="$1"
   gz_file="$2"
   gzip -c -- "$body_file" > "$gz_file"
+  # Hand the bearer token to curl via a config file fed on stdin
+  # (`curl -K -`). On default Ubuntu/Debian /proc is mounted without
+  # hidepid, so any local user could otherwise read the token via
+  # /proc/$(pidof curl)/cmdline while the agent is mid-push. The
+  # config file form keeps the secret in process memory only.
   http=$(
-    curl -sS -o /dev/null -w '%{http_code}' \
+    printf '%s\n' "header = \"Authorization: Bearer $PR_AGENT_TOKEN\"" \
+    | curl -sS -o /dev/null -w '%{http_code}' \
       --max-time "$PR_HTTP_TIMEOUT" \
       -H 'Content-Type: application/json' \
       -H 'Content-Encoding: gzip' \
-      -H "Authorization: Bearer $PR_AGENT_TOKEN" \
       -H "X-Agent-Id: $PR_AGENT_ID" \
       -H "X-Agent-Version: $PR_AGENT_VERSION" \
+      -K - \
       --data-binary "@$gz_file" \
       "$PR_INGEST_URL"
   ) || http=000
