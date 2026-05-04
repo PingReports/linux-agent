@@ -26,7 +26,7 @@ AGENT_CONF_DIR="/etc/pingreports-agent"
 AGENT_CONF="$AGENT_CONF_DIR/agent.conf"
 SVC_NAME="pingreports-agent.service"
 TMR_NAME="pingreports-agent.timer"
-DEFAULT_INGEST="https://agents-pr.sxp.dev/v1/ingest"
+DEFAULT_INGEST="https://agents.pingreports.com/v1/ingest"
 
 PR_AGENT_VERSION="0.2.0"
 
