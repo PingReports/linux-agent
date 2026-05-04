@@ -313,7 +313,13 @@ collect_podman_metrics() {
 collect_proc_metrics() {
   # Per-comm time-series metrics for the drill-down. We sum across all
   # PIDs of the same comm so the chart stays continuous when a process
-  # restarts and gets a new pid. Top-N by CPU only — bound cardinality.
+  # restarts and gets a new pid.
+  #
+  # Cardinality is bounded by emitting only the UNION of the top-N by
+  # CPU and top-N by RSS — same set the inventory drill-down will show
+  # as clickable rows. Without this the user can click a memory-heavy
+  # process that never appears in CPU top-N and the per-comm chart
+  # stays empty.
   ps -eo pcpu,pmem,rss,comm --no-headers 2>/dev/null \
     | awk -v top="$PR_TOP_N" '
         {
@@ -323,8 +329,6 @@ collect_proc_metrics() {
               || comm == "agent.sh" || comm == "logger" || comm == "wc" \
               || comm == "tail" || comm == "head" || comm == "tr" \
               || comm == "cut" || comm == "mktemp" || comm == "rm") next
-          # Sanitise comm for label (CH LowCardinality(String) accepts any
-          # string but we keep a-z0-9_.- only for safety + readability).
           gsub(/[^a-zA-Z0-9_.-]/, "_", comm)
           if (length(comm) == 0) next
           cpu_by[comm] += pcpu + 0
@@ -332,20 +336,25 @@ collect_proc_metrics() {
           rss_by[comm] += rss + 0
         }
         END {
-          # Pick top-N by CPU then top-N by RSS, dedup by comm.
+          # Build CPU-sorted and RSS-sorted lists.
           n=0
-          for (c in cpu_by) { sorted_cpu[++n] = cpu_by[c] "\t" c }
-          # Insertion sort desc — small N
+          for (c in cpu_by) { sorted_cpu[++n] = cpu_by[c] "\t" c; sorted_rss[n] = rss_by[c] "\t" c }
+          # Insertion-sort both arrays descending — small N.
           for (i=2; i<=n; i++) {
             x = sorted_cpu[i]; split(x, p, "\t"); xv = p[1] + 0
             j = i - 1
             while (j >= 1) { split(sorted_cpu[j], q, "\t"); if (q[1] + 0 < xv) { sorted_cpu[j+1] = sorted_cpu[j]; j-- } else break }
             sorted_cpu[j+1] = x
+            x = sorted_rss[i]; split(x, p, "\t"); xv = p[1] + 0
+            j = i - 1
+            while (j >= 1) { split(sorted_rss[j], q, "\t"); if (q[1] + 0 < xv) { sorted_rss[j+1] = sorted_rss[j]; j-- } else break }
+            sorted_rss[j+1] = x
           }
-          # Emit top-N
-          for (i=1; i<=n && i<=top; i++) {
-            split(sorted_cpu[i], p, "\t")
-            c = p[2]
+          # Union of top-N CPU and top-N RSS.
+          delete keep
+          for (i=1; i<=n && i<=top; i++) { split(sorted_cpu[i], p, "\t"); keep[p[2]] = 1 }
+          for (i=1; i<=n && i<=top; i++) { split(sorted_rss[i], p, "\t"); keep[p[2]] = 1 }
+          for (c in keep) {
             printf "proc_cpu_pct{comm=\"%s\"}=%s\n", c, cpu_by[c]
             printf "proc_mem_pct{comm=\"%s\"}=%s\n", c, mem_by[c]
             printf "proc_rss_kb{comm=\"%s\"}=%s\n",  c, rss_by[c]
