@@ -102,8 +102,16 @@ install_pkgs() {
   esac
 }
 
+# A small "still alive" heartbeat — apt/dnf can be slow without showing
+# anything which leaves the operator wondering if the curl|sh hung. We
+# print a short banner before each phase.
+say() { printf '\033[1;36m[pingreports-agent]\033[0m %s\n' "$1" >&2; }
+say "Installing PingReports linux agent (this takes ~30-60s)…"
+
+say "[1/5] installing packages via $PM ($PKG_LIST)"
 install_pkgs
 
+say "[2/5] creating system user $AGENT_USER"
 # 3. user
 if ! id -u "$AGENT_USER" >/dev/null 2>&1; then
   useradd --system --home-dir "$AGENT_HOME" --shell /usr/sbin/nologin --create-home "$AGENT_USER" \
@@ -177,6 +185,7 @@ fi
 # 4. agent binary (this script's sibling). The installer ships agent.sh
 # either alongside itself (curl-piped install pulls it via INSTALL_SOURCE_URL)
 # or as a tarball.
+say "[3/5] fetching agent.sh"
 : "${PR_AGENT_BRANCH:=main}"
 SRC="${PR_AGENT_SRC:-https://raw.githubusercontent.com/PingReports/linux-agent/${PR_AGENT_BRANCH}/agent.sh}"
 if [ -r "$(dirname "$0")/agent.sh" ] && [ -z "${PR_AGENT_FORCE_REMOTE:-}" ]; then
@@ -187,6 +196,7 @@ else
   mv -f "$AGENT_LIB/agent.sh.new" "$AGENT_LIB/agent.sh"
 fi
 
+say "[4/5] writing config + systemd unit"
 # 5. config (rendered fresh each run)
 umask 077
 cat > "$AGENT_CONF.new" <<EOF
@@ -271,6 +281,7 @@ EOF
 systemctl daemon-reload
 systemctl enable --now "$TMR_NAME" >/dev/null 2>&1 || systemctl enable --now "$TMR_NAME"
 
+say "[5/5] kicking the first push (so the agent shows up in the UI immediately)"
 # Run once immediately so the operator sees an entry in the UI without
 # having to wait for the first jittered tick.
 systemctl start "$SVC_NAME" >/dev/null 2>&1 || true
