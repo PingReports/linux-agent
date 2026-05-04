@@ -504,22 +504,29 @@ inventory_top_processes() {
 
 inventory_systemd_all() {
   # All loaded units (services + scopes + sockets + timers + targets +
-  # mounts) with their state — capped to a generous-but-bounded list.
+  # mounts) with their state — capped to PR_SERVICES_MAX. Each field is
+  # piped through json_escape so backslash sequences in unit names like
+  # `dev-disk-by\x2ddiskseq.device` (systemd's own escape for non-name
+  # characters) become valid JSON `\\x2d` instead of an invalid `\x` JSON
+  # escape that breaks the whole payload.
   if ! have systemctl; then printf '"systemd_units":[]'; return 0; fi
   tmp="$(mktemp)"
   systemctl list-units --all --no-pager --no-legend --plain 2>/dev/null \
-    | awk -v max="$PR_SERVICES_MAX" '
-        NR>max { exit }
-        NF>=4 {
-          unit=$1; load=$2; active=$3; sub_=$4;
-          desc=""
-          for (i=5; i<=NF; i++) desc = desc (i==5?"":" ") $i
-          gsub(/"/, "\\\"", desc)
-          gsub(/\\/, "\\\\", desc)
-          printf "{\"unit\":\"%s\",\"load\":\"%s\",\"active\":\"%s\",\"sub\":\"%s\",\"desc\":\"%s\"}\n",
-            unit, load, active, sub_, desc
-        }
-      ' > "$tmp"
+    | head -"$PR_SERVICES_MAX" \
+    | while IFS= read -r line; do
+        unit=$(printf '%s' "$line"   | awk '{print $1}')
+        load=$(printf '%s' "$line"   | awk '{print $2}')
+        active=$(printf '%s' "$line" | awk '{print $3}')
+        sub_=$(printf '%s' "$line"   | awk '{print $4}')
+        desc=$(printf '%s' "$line"   | awk '{for(i=5;i<=NF;i++) printf "%s%s", (i==5?"":" "), $i}')
+        [ -z "$unit" ] && continue
+        printf '{"unit":"%s","load":"%s","active":"%s","sub":"%s","desc":"%s"}\n' \
+          "$(printf '%s' "$unit"   | json_escape)" \
+          "$(printf '%s' "$load"   | json_escape)" \
+          "$(printf '%s' "$active" | json_escape)" \
+          "$(printf '%s' "$sub_"   | json_escape)" \
+          "$(printf '%s' "$desc"   | json_escape)" >> "$tmp"
+      done
   printf '"systemd_units":['
   awk 'NR>1{printf ","} {printf "%s", $0}' "$tmp"
   printf ']'
