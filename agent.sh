@@ -536,12 +536,15 @@ inventory_systemd_all() {
 inventory_established_connections() {
   if ! have ss; then printf '"established":[]'; return 0; fi
   tmp="$(mktemp)"
-  # ss columns: state recv-q send-q local-addr:port peer-addr:port [users:(("name",pid=N,fd=N))]
+  # `ss -tnH state established` columns are
+  #   recv-q  send-q  local-addr:port  peer-addr:port  [users:((...))]
+  # — the state column is consumed by the filter and not echoed, so we
+  # need $3 (local) and $4 (peer), not $4 / $5.
   ss -tnH state established 2>/dev/null | head -200 \
     | while IFS= read -r line; do
-        local_addr=$(printf '%s' "$line" | awk '{print $4}')
-        remote_addr=$(printf '%s' "$line" | awk '{print $5}')
-        users=$(printf '%s' "$line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i}')
+        local_addr=$(printf '%s' "$line" | awk '{print $3}')
+        remote_addr=$(printf '%s' "$line" | awk '{print $4}')
+        users=$(printf '%s' "$line" | awk '{for(i=5;i<=NF;i++) printf "%s ", $i}')
         [ -z "$local_addr" ] || [ -z "$remote_addr" ] && continue
         local_ip="${local_addr%:*}"; local_port="${local_addr##*:}"
         remote_ip="${remote_addr%:*}"; remote_port="${remote_addr##*:}"
@@ -648,17 +651,41 @@ inventory_gpus() {
 
 inventory_pending_updates() {
   total=0; sec=0; reboot=0
+  list_tmp="$(mktemp)"
   if have apt-get && [ -r /var/lib/apt/lists ]; then
-    total=$(apt list --upgradable 2>/dev/null | tail -n +2 | wc -l | awk '{print $1}')
-    sec=$(apt list --upgradable 2>/dev/null | tail -n +2 | grep -ic 'security' || true)
-    [ -z "$sec" ] && sec=0
+    # `apt list --upgradable` lines look like
+    # `pkg/repo new-version arch [upgradable from: old-version]`. Parse
+    # name + new-version + repo; flag entries from a -security pocket.
+    apt list --upgradable 2>/dev/null | tail -n +2 \
+      | awk '
+          /\// {
+            n=split($1, parts, "/")
+            name=parts[1]; repo=parts[2]
+            ver=$2
+            sec="0"; if (repo ~ /security/) sec="1"
+            printf "{\"name\":\"%s\",\"version\":\"%s\",\"repo\":\"%s\",\"security\":%s}\n", name, ver, repo, sec
+          }' | head -200 > "$list_tmp"
+    total=$(wc -l < "$list_tmp" | awk '{print $1}')
+    sec=$(grep -c '"security":1' "$list_tmp" || true)
   elif have dnf; then
-    total=$(dnf -q check-update 2>/dev/null | grep -Ec '^[a-zA-Z0-9]')
-    sec=$(dnf -q check-update --security 2>/dev/null | grep -Ec '^[a-zA-Z0-9]')
+    dnf -q check-update 2>/dev/null \
+      | awk 'NF==3 && $0 !~ /^Last metadata|^[[:space:]]/ {
+          printf "{\"name\":\"%s\",\"version\":\"%s\",\"repo\":\"%s\",\"security\":0}\n", $1, $2, $3
+        }' | head -200 > "$list_tmp"
+    sec_names=$(dnf -q check-update --security 2>/dev/null | awk 'NF==3 {print $1}' | tr '\n' '|' | sed 's/|$//')
+    if [ -n "$sec_names" ]; then
+      sed -i -E "s/(\"name\":\"($sec_names)\",[^}]*\"security\":)0/\11/g" "$list_tmp" 2>/dev/null || true
+    fi
+    total=$(wc -l < "$list_tmp" | awk '{print $1}')
+    sec=$(grep -c '"security":1' "$list_tmp" || true)
   fi
+  [ -z "$sec" ] && sec=0
   [ -e /var/run/reboot-required ] || [ -e /run/reboot-required ] && reboot=1 || reboot=0
-  printf '"updates":{"total":%s,"security":%s,"reboot_required":%s}' \
+  printf '"updates":{"total":%s,"security":%s,"reboot_required":%s,"packages":[' \
     "${total:-0}" "${sec:-0}" "${reboot:-0}"
+  awk 'NR>1{printf ","} {printf "%s", $0}' "$list_tmp"
+  printf ']}'
+  rm -f "$list_tmp"
 }
 
 inventory_listening_ports() {
