@@ -7,7 +7,7 @@ gzipped JSON batch to the configured ingest endpoint.
 ## Install
 
 ```
-curl -fsSL https://app.pingreports.com/agents/install.sh \
+curl -fsSL https://raw.githubusercontent.com/PingReports/linux-agent/main/install.sh \
   | sudo PR_AGENT_ID=<id> PR_AGENT_TOKEN=<token> sh
 ```
 
