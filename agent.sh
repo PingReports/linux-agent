@@ -229,6 +229,10 @@ collect_temps() {
         # Extract first numeric value (pcpu /pmem etc).
         if (match(rest, /[+-]?[0-9]+\.[0-9]+/)) {
           v = substr(rest, RSTART, RLENGTH)
+          # `sensors` prints "+45.0" / "+12.0 V" with a leading plus that
+          # is not valid JSON. Strip it so downstream JSON emitters can
+          # interpolate the value verbatim into `"value":<v>`.
+          sub(/^\+/, "", v)
           if (rest ~ /°C/ || rest ~ / C/) {
             printf "sensor_temp_c{name=\"%s\"}=%s\n", (adapter "_" label), v
           } else if (rest ~ / V/) {
